@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Infos GitHub pour le tableau de bord Quickshell (onglet GitHub), via `gh` (auth : gh auth login).
+
+Output: one JSON document on stdout
+  {"profile", "contrib", "events", "lists": {"prs", "reviews", "assigned", "issues"},
+   "notifications", "billing", "ts"}  — ou {"error": "..."} si gh n'est pas utilisable.
+Cached 5 min in ~/.cache/dashboard-github.json (`github-fetch --force` pour ignorer le cache).
+Facturation : API « enhanced billing » (/users/<login>/settings/billing/...), demande le scope
+`user` → gh auth refresh -h github.com -s user. Sans lui, seule la section facturation manque.
+"""
+import json, shutil, subprocess, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+
+CACHE = Path.home() / ".cache/dashboard-github.json"
+AVATAR = Path.home() / ".cache/dashboard-github/avatar.png"
+TTL = 300
+COUNT = 10
+GH = shutil.which("gh") or "/home/linuxbrew/.linuxbrew/bin/gh"
+
+
+class GhError(Exception):
+    pass
+
+
+def gh(*args):
+    r = subprocess.run([GH, "api", *args], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise GhError((r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout).strip() else "gh api a échoué")
+    return json.loads(r.stdout) if r.stdout.strip() else None
+
+
+def ts(iso):
+    return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()) if iso else 0
+
+
+SEARCH_FIELDS = """
+  issueCount
+  nodes {
+    ... on PullRequest { title number url isDraft updatedAt reviewDecision
+      repository { nameWithOwner }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } }
+    ... on Issue { title number url updatedAt
+      repository { nameWithOwner }
+      comments { totalCount } }
+  }"""
+
+QUERY = """
+query($prs: String!, $reviews: String!, $assigned: String!, $issues: String!) {
+  viewer {
+    login name bio company location websiteUrl createdAt avatarUrl(size: 200)
+    status { emoji message }
+    followers { totalCount } following { totalCount } starredRepositories { totalCount }
+    repositories(ownerAffiliations: OWNER) { totalCount }
+    publicRepos: repositories(ownerAffiliations: OWNER, privacy: PUBLIC) { totalCount }
+    organizations(first: 10) { nodes { login } }
+    contributionsCollection {
+      totalCommitContributions totalPullRequestContributions totalIssueContributions
+      totalPullRequestReviewContributions restrictedContributionsCount
+      contributionCalendar { totalContributions weeks { contributionDays { date contributionCount contributionLevel } } }
+    }
+  }
+  prs: search(query: $prs, type: ISSUE, first: %d) { %s }
+  reviews: search(query: $reviews, type: ISSUE, first: %d) { %s }
+  assigned: search(query: $assigned, type: ISSUE, first: %d) { %s }
+  issues: search(query: $issues, type: ISSUE, first: %d) { %s }
+}""" % (COUNT, SEARCH_FIELDS, COUNT, SEARCH_FIELDS, COUNT, SEARCH_FIELDS, COUNT, SEARCH_FIELDS)
+
+
+def search_list(s):
+    items = []
+    for n in s["nodes"]:
+        if not n:
+            continue
+        it = {"title": n["title"], "number": n["number"], "url": n["url"],
+              "repo": n["repository"]["nameWithOwner"], "ts": ts(n["updatedAt"])}
+        if "isDraft" in n:
+            rollup = (n["commits"]["nodes"] or [{}])[0].get("commit", {}).get("statusCheckRollup")
+            it.update(draft=n["isDraft"], review=n["reviewDecision"] or "",
+                      checks=rollup["state"] if rollup else "")
+        else:
+            it["comments"] = n["comments"]["totalCount"]
+        items.append(it)
+    return {"count": s["issueCount"], "items": items}
+
+
+def streaks(days):
+    """Série en cours (aujourd'hui sans contribution ne la casse pas encore) et record."""
+    best = cur = 0
+    for d in days:
+        cur = cur + 1 if d["contributionCount"] else 0
+        best = max(best, cur)
+    current = 0
+    for i, d in enumerate(reversed(days)):
+        if d["contributionCount"]:
+            current += 1
+        elif i:
+            break
+    return current, best
+
+
+def describe(e):
+    """Événement de l'API events → (icône, texte, url)."""
+    t, p, repo = e["type"], e.get("payload", {}), e["repo"]["name"]
+    web = "https://github.com/" + repo
+    if t == "PushEvent":
+        n = p.get("size") or p.get("distinct_size") or len(p.get("commits", [])) or 1
+        branch = p.get("ref", "").removeprefix("refs/heads/")
+        return "󰜘", f"{n} commit{'s' if n > 1 else ''} poussé{'s' if n > 1 else ''} sur {branch}", \
+            f"{web}/commits/{branch}" if branch else web
+    if t == "PullRequestEvent":
+        pr = p.get("pull_request", {})
+        n = pr.get("number") or p.get("number", "")
+        act = {"opened": "ouverte", "closed": "fermée", "reopened": "rouverte"}.get(p.get("action"), p.get("action", ""))
+        return "\uf407", f"PR #{n} {act}", f"{web}/pull/{n}"
+    if t == "PullRequestReviewEvent":
+        n = p.get("pull_request", {}).get("number", "")
+        return "󰈈", f"Review de #{n}", f"{web}/pull/{n}"
+    if t == "PullRequestReviewCommentEvent":
+        pr = p.get("pull_request", {})
+        return "󰅺", f"Commentaire de review sur #{pr.get('number', '')}", p.get("comment", {}).get("html_url", web)
+    if t == "IssuesEvent":
+        i = p.get("issue", {})
+        act = {"opened": "ouverte", "closed": "fermée", "reopened": "rouverte"}.get(p.get("action"), p.get("action", ""))
+        return "\uf41b", f"Issue #{i.get('number', '')} {act}", i.get("html_url") or f"{web}/issues/{i.get('number', '')}"
+    if t == "IssueCommentEvent":
+        i = p.get("issue", {})
+        return "󰅺", f"Commentaire sur #{i.get('number', '')}", \
+            p.get("comment", {}).get("html_url") or f"{web}/issues/{i.get('number', '')}"
+    if t == "CreateEvent":
+        kind = {"repository": "Dépôt", "branch": "Branche", "tag": "Tag"}.get(p.get("ref_type"), p.get("ref_type", ""))
+        return "󰐕", f"{kind} créé{'e' if kind == 'Branche' else ''} {p.get('ref') or ''}".strip(), web
+    if t == "DeleteEvent":
+        kind = {"branch": "Branche", "tag": "Tag"}.get(p.get("ref_type"), p.get("ref_type", ""))
+        return "󰆴", f"{kind} supprimé{'e' if kind == 'Branche' else ''} {p.get('ref', '')}", web
+    if t == "WatchEvent":
+        return "\uf005", "A ajouté une étoile", web
+    if t == "ForkEvent":
+        return "\uf402", "A forké le dépôt", p.get("forkee", {}).get("html_url", web)
+    if t == "ReleaseEvent":
+        r = p.get("release", {})
+        return "\uf02b", f"Release {r.get('tag_name', '')} publiée", r.get("html_url", web)
+    if t == "PublicEvent":
+        return "󰈈", "Dépôt rendu public", web
+    if t == "MemberEvent":
+        return "\uf406", f"Collaborateur {p.get('member', {}).get('login', '')} ajouté", web
+    return "•", t.removesuffix("Event"), web
+
+
+def number_of(e):
+    p = e.get("payload", {})
+    obj = p.get("pull_request") or p.get("issue") or {}
+    return obj.get("number") or p.get("number")
+
+
+def titles(events):
+    """L'API events ne donne plus les titres de PR/issues : une requête GraphQL groupée les retrouve
+    (et distingue une PR fusionnée d'une PR simplement fermée)."""
+    refs = sorted({(e["repo"]["name"], number_of(e)) for e in events if number_of(e)})
+    if not refs:
+        return {}
+    parts = []
+    for i, (repo, n) in enumerate(refs):
+        owner, name = repo.split("/", 1)
+        parts.append(f'r{i}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) '
+                     f'{{ issueOrPullRequest(number: {int(n)}) {{ ... on Issue {{ title }} '
+                     f'... on PullRequest {{ title merged }} }} }}')
+    try:
+        data = gh("graphql", "-f", "query={ " + " ".join(parts) + " }")["data"]
+    except (GhError, KeyError, TypeError):
+        return {}
+    out = {}
+    for i, ref in enumerate(refs):
+        node = ((data.get(f"r{i}") or {}).get("issueOrPullRequest")) or {}
+        if node:
+            out[ref] = node
+    return out
+
+
+def ci_runs(login, repos):
+    """Derniers runs GitHub Actions déclenchés par l'utilisateur sur ses dépôts actifs (hors Dependabot)."""
+    def runs(repo):
+        try:
+            data = gh(f"/repos/{repo}/actions/runs?actor={login}&per_page=15")
+        except GhError:
+            return []
+        out = []
+        for r in data.get("workflow_runs", []):
+            if r.get("event") == "dynamic":
+                continue
+            start, end = ts(r.get("run_started_at") or r["created_at"]), ts(r["updated_at"])
+            out.append({"workflow": r["name"], "title": r.get("display_title") or r["name"],
+                        "branch": r.get("head_branch") or "", "repo": repo, "event": r.get("event", ""),
+                        "status": r["status"], "conclusion": r.get("conclusion") or "",
+                        "url": r["html_url"], "ts": ts(r["created_at"]),
+                        "duration": end - start if r["status"] == "completed" else int(time.time()) - start})
+        return out
+    with ThreadPoolExecutor(6) as pool:
+        all_runs = [r for rs in pool.map(runs, repos) for r in rs]
+    all_runs.sort(key=lambda r: -r["ts"])
+    return {"count": sum(r["status"] != "completed" or r["conclusion"] == "failure" for r in all_runs[:COUNT * 2]),
+            "items": all_runs[:COUNT * 2]}
+
+
+def billing(login):
+    """Usage du mois en cours (enhanced billing), regroupé par produit."""
+    now = datetime.now(timezone.utc)
+    try:
+        usage = gh(f"/users/{login}/settings/billing/usage?year={now.year}&month={now.month}")
+    except GhError as e:
+        msg = str(e)
+        if "404" in msg or "403" in msg or "scope" in msg.lower():
+            msg = "Scope « user » manquant : gh auth refresh -h github.com -s user"
+        return {"error": msg}
+    products = {}
+    for u in usage.get("usageItems", []):
+        p = products.setdefault(u.get("product", "?"), {"product": u.get("product", "?"), "quantity": 0.0,
+                                                        "unit": u.get("unitType", ""), "gross": 0.0, "net": 0.0})
+        p["quantity"] += u.get("quantity") or 0
+        p["gross"] += u.get("grossAmount") or 0
+        p["net"] += u.get("netAmount") or 0
+    items = sorted(products.values(), key=lambda p: -p["gross"])
+    out = {"month": now.strftime("%Y-%m"), "items": items,
+           "gross": sum(p["gross"] for p in items), "net": sum(p["net"] for p in items)}
+    try:
+        prem = gh(f"/users/{login}/settings/billing/premium_request/usage?year={now.year}&month={now.month}")
+        pi = prem.get("usageItems", [])
+        out["premium"] = {"quantity": sum(u.get("grossQuantity") or 0 for u in pi),
+                          "net": sum(u.get("netAmount") or 0 for u in pi)}
+    except GhError:
+        pass
+    return out
+
+
+def fetch():
+    user = gh("/user")
+    login = user["login"]
+    q = lambda s: f"{s} archived:false sort:updated-desc"
+    with ThreadPoolExecutor(4) as pool:
+        f_gql = pool.submit(gh, "graphql", "-f", f"query={QUERY}",
+                            "-f", "prs=" + q(f"is:pr is:open author:{login}"),
+                            "-f", "reviews=" + q(f"is:pr is:open review-requested:{login}"),
+                            "-f", "assigned=" + q(f"is:issue is:open assignee:{login}"),
+                            "-f", "issues=" + q(f"is:issue is:open author:{login}"))
+        f_events = pool.submit(gh, f"/users/{login}/events?per_page=40")
+        f_notif = pool.submit(gh, "/notifications?per_page=100")
+        f_bill = pool.submit(billing, login)
+        data = f_gql.result()["data"]
+        events, notif, bill = f_events.result(), None, f_bill.result()
+        try:
+            notif = f_notif.result()
+        except GhError:
+            pass
+    v = data["viewer"]
+    cc = v["contributionsCollection"]
+    days = [d for w in cc["contributionCalendar"]["weeks"] for d in w["contributionDays"]]
+    current, best = streaks(days)
+
+    try:
+        AVATAR.parent.mkdir(parents=True, exist_ok=True)
+        with urllib.request.urlopen(v["avatarUrl"], timeout=10) as r:
+            AVATAR.write_bytes(r.read())
+    except Exception:
+        pass
+
+    events = sorted(events or [], key=lambda e: e["created_at"], reverse=True)[:30]
+    known = titles(events)
+    ev = []
+    for e in events:
+        icon, text, url = describe(e)
+        node = known.get((e["repo"]["name"], number_of(e)))
+        if node:
+            if e["type"] == "PullRequestEvent" and e["payload"].get("action") == "closed" and node.get("merged"):
+                icon, text = "\uf419", text.replace("fermée", "fusionnée")
+            text += " : " + node["title"]
+        if ev and ev[-1]["text"] == text and ev[-1]["repo"] == e["repo"]["name"]:
+            continue
+        ev.append({"icon": icon, "text": text, "url": url, "repo": e["repo"]["name"], "ts": ts(e["created_at"])})
+        if len(ev) >= COUNT:
+            break
+
+    # Dépôts actifs = ceux des derniers événements et des PR ouvertes
+    repos = list(dict.fromkeys([e["repo"]["name"] for e in events] +
+                               [n["repository"]["nameWithOwner"] for n in data["prs"]["nodes"] if n]))[:6]
+    ci = ci_runs(login, repos)
+
+    plan = user.get("plan") or {}
+    return {
+        "profile": {
+            "login": login, "name": v["name"] or login, "bio": v["bio"] or "", "company": v["company"] or "",
+            "location": v["location"] or "", "blog": v["websiteUrl"] or "", "url": user["html_url"],
+            "avatar": str(AVATAR) if AVATAR.exists() else "", "since": ts(v["createdAt"]),
+            "status": ((v["status"] or {}).get("message") or ""),
+            "followers": v["followers"]["totalCount"], "following": v["following"]["totalCount"],
+            "repos": v["repositories"]["totalCount"], "publicRepos": v["publicRepos"]["totalCount"],
+            "stars": v["starredRepositories"]["totalCount"],
+            "orgs": [o["login"] for o in v["organizations"]["nodes"]],
+            "plan": (plan.get("name") or "").capitalize(), "twoFactor": user.get("two_factor_authentication"),
+        },
+        "contrib": {
+            "total": cc["contributionCalendar"]["totalContributions"],
+            "commits": cc["totalCommitContributions"], "prs": cc["totalPullRequestContributions"],
+            "issues": cc["totalIssueContributions"], "reviews": cc["totalPullRequestReviewContributions"],
+            "private": cc["restrictedContributionsCount"], "streak": current, "bestStreak": best,
+            "days": [{"date": d["date"], "count": d["contributionCount"], "level": d["contributionLevel"]} for d in days],
+        },
+        "events": ev,
+        "lists": {**{k: search_list(data[k]) for k in ("prs", "reviews", "assigned", "issues")}, "ci": ci},
+        "notifications": None if notif is None else {
+            "unread": sum(1 for n in notif if n.get("unread")), "more": len(notif) >= 100,
+            "items": [{"title": n["subject"]["title"], "repo": n["repository"]["full_name"],
+                       "type": n["subject"]["type"], "ts": ts(n["updated_at"])} for n in notif[:5]],
+        },
+        "billing": bill,
+        "ts": int(time.time()),
+    }
+
+
+def main():
+    force = "--force" in sys.argv
+    try:
+        cached = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        cached = None
+    if cached and not force and time.time() - cached.get("ts", 0) < TTL:
+        print(json.dumps(cached))
+        return
+    try:
+        out = fetch()
+    except FileNotFoundError:
+        out = {"error": "gh introuvable (brew install gh)"}
+    except (GhError, subprocess.TimeoutExpired, KeyError, TypeError) as e:
+        msg = str(e)
+        if "auth login" in msg or "401" in msg or "not logged" in msg.lower():
+            msg = "Non connecté : lancer « gh auth login -s user » dans un terminal"
+        out = {"error": msg}
+        if cached and "profile" in cached:  # hors ligne : on garde l'ancien état
+            cached["stale"] = msg
+            out = cached
+    else:
+        CACHE.write_text(json.dumps(out))
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()

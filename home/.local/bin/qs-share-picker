@@ -1,0 +1,12 @@
+#!/bin/bash
+# Sélecteur de partage d'écran façon GNOME, pour xdg-desktop-portal-hyprland
+# (screencopy:custom_picker_binary dans ~/.config/hypr/xdph.conf).
+# xdph lit stdout : seule la ligne « [SELECTION]… » doit y sortir, donc Quickshell écrit
+# son choix dans un fichier temporaire et ses propres logs partent à la poubelle.
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+token=0
+[[ " $* " == *" --allow-token "* ]] && token=1
+SHARE_PICKER_OUT="$out" SHARE_PICKER_TOKEN="$token" \
+    qs -p "$HOME/.config/quickshell/sharepicker" >/dev/null 2>&1
+cat "$out"

@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Calques de la carte météo du tableau de bord (façon Apple Météo) : précipitations, vent, température,
+qualité de l'air (indice européen EAQI, Open-Meteo Air Quality / CAMS, mêmes points que la grille).
+
+- Radar : RainViewer (sans clé ; 2 h passées par pas de 10 min, zoom 7 max, une seule palette).
+- Prévisions : grille Open-Meteo de 13 × 11 points autour de la ville (24 h), plus le point exact
+  de la ville en tête de liste. Chaque point compte comme un appel → grille en cache 1 h.
+- « relevant » : calque le plus parlant pour les prochaines heures (pluie > vent > chaleur/gel > température).
+
+Ville : ~/.config/quickshell/weather-location.json (comme weather-fetch).
+Sortie : un document JSON sur stdout. Cache : ~/.cache/dashboard-weather-map.json.
+Texture pour les shaders de WeatherMap.qml : ~/.cache/dashboard-weather-map/atlas-<horodatage>.png,
+une bande de nlat lignes par heure ; trois blocs de nlon px : R = température, G/B = vent u/v ; R = pluie ;
+R = EAQI / 150.
+"""
+import json, math, struct, sys, time, urllib.parse, urllib.request, zlib
+from datetime import datetime
+from pathlib import Path
+
+LOC = Path.home() / ".config/quickshell/weather-location.json"
+CACHE = Path.home() / ".cache/dashboard-weather-map.json"
+GRID_TTL, RADAR_TTL = 3600, 300
+NLAT, NLON, DLAT, DLON = 11, 13, 0.6, 0.9   # ±3° de latitude, ±5,4° de longitude
+HOURS = 24
+UA = {"User-Agent": "hantrox-dashboard/1.0 (Quickshell)"}
+
+def get(url):
+    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=15) as r:
+        return json.load(r)
+
+def hhmm(t):
+    return datetime.fromtimestamp(t).strftime("%H h")
+
+def fetch_grid(loc):
+    lats = [round(loc["lat"] + (j - NLAT // 2) * DLAT, 3) for j in range(NLAT)]
+    lons = [round(loc["lon"] + (i - NLON // 2) * DLON, 3) for i in range(NLON)]
+    pts = [(loc["lat"], loc["lon"])] + [(la, lo) for la in lats for lo in lons]
+    params = urllib.parse.urlencode({
+        "latitude": ",".join(str(p[0]) for p in pts), "longitude": ",".join(str(p[1]) for p in pts),
+        "hourly": "temperature_2m,precipitation,wind_speed_10m,wind_direction_10m,wind_gusts_10m",
+        "forecast_hours": HOURS, "timeformat": "unixtime", "timezone": "auto",
+    })
+    data = get("https://api.open-meteo.com/v1/forecast?" + params)
+    here, cells = data[0]["hourly"], [d["hourly"] for d in data[1:]]
+    # Qualité de l'air : facultative (la carte reste utile sans)
+    try:
+        aq = get("https://air-quality-api.open-meteo.com/v1/air-quality?" + urllib.parse.urlencode({
+            "latitude": ",".join(str(p[0]) for p in pts), "longitude": ",".join(str(p[1]) for p in pts),
+            "hourly": "european_aqi,pm2_5", "forecast_hours": HOURS, "timeformat": "unixtime", "timezone": "auto",
+        }))
+        aq_here, aq_cells = aq[0]["hourly"], [d["hourly"] for d in aq[1:]]
+        if aq_here["time"][0] != here["time"][0]:
+            raise ValueError("heures décalées")
+    except Exception:
+        aq_here = aq_cells = None
+    times = here["time"]
+    temp, rain, u, v, air = [], [], [], [], []
+    for h in range(len(times)):
+        if aq_cells:
+            air.append([round(c["european_aqi"][h] or 0) for c in aq_cells])
+        temp.append([round(c["temperature_2m"][h] or 0, 1) for c in cells])
+        rain.append([round(c["precipitation"][h] or 0, 2) for c in cells])
+        uu, vv = [], []
+        for c in cells:
+            s, d = c["wind_speed_10m"][h] or 0, math.radians(c["wind_direction_10m"][h] or 0)
+            # direction météo = d'où vient le vent → vecteur vers où il va
+            uu.append(round(-s * math.sin(d), 1)); vv.append(round(-s * math.cos(d), 1))
+        u.append(uu); v.append(vv)
+    return {
+        "fetched": time.time(),
+        "grid": {"lat0": lats[0], "lon0": lons[0], "dlat": DLAT, "dlon": DLON, "nlat": NLAT, "nlon": NLON,
+                 "times": times, "temp": temp, "rain": rain, "u": u, "v": v, "air": air or None},
+        "here": {"temp": here["temperature_2m"], "rain": here["precipitation"],
+                 "wind": here["wind_speed_10m"], "gust": here["wind_gusts_10m"], "dir": here["wind_direction_10m"],
+                 "air": aq_here["european_aqi"] if aq_here else None, "pm25": aq_here["pm2_5"] if aq_here else None},
+    }
+
+ATLAS_DIR = Path.home() / ".cache/dashboard-weather-map"
+
+def byte(x):
+    return max(0, min(255, round(x * 255)))
+
+def write_atlas(cache):
+    """PNG RVBA opaque (alpha prémultiplié par Qt sinon) ; décodage dans weather-heat.frag / weather-wind.frag."""
+    g = cache["grid"]
+    nlon, nlat = g["nlon"], g["nlat"]
+    rows = []
+    for h in range(len(g["times"])):
+        for j in range(nlat):
+            row = bytearray(b"\0")
+            for i in range(nlon):
+                k = j * nlon + i
+                row += bytes((byte((g["temp"][h][k] + 30) / 80), byte((g["u"][h][k] + 120) / 240), byte((g["v"][h][k] + 120) / 240), 255))
+            for i in range(nlon):
+                row += bytes((byte(math.sqrt(min(g["rain"][h][j * nlon + i], 30) / 30)), 0, 0, 255))
+            for i in range(nlon):
+                row += bytes((byte(g["air"][h][j * nlon + i] / 150) if g.get("air") else 0, 0, 0, 255))
+            rows.append(bytes(row))
+    chunk = lambda t, data: struct.pack(">I", len(data)) + t + data + struct.pack(">I", zlib.crc32(t + data))
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 3 * nlon, len(rows), 8, 6, 0, 0, 0)) \
+        + chunk(b"IDAT", zlib.compress(b"".join(rows))) + chunk(b"IEND", b"")
+    ATLAS_DIR.mkdir(parents=True, exist_ok=True)
+    path = ATLAS_DIR / f"atlas-{int(cache['fetched'])}.png"
+    path.write_bytes(png)
+    for old in ATLAS_DIR.glob("atlas-*.png"):
+        if old != path:
+            old.unlink(missing_ok=True)
+    cache["atlas"] = str(path)
+
+def aqi_label(v):
+    """Classes de l'indice européen (EEA)."""
+    for lim, name in ((20, "Bonne"), (40, "Moyenne"), (60, "Dégradée"), (80, "Mauvaise"), (100, "Très mauvaise")):
+        if v < lim:
+            return name
+    return "Extrêmement mauvaise"
+
+def relevance(g):
+    h, t = g["here"], g["grid"]["times"]
+    for i in range(min(6, len(t))):
+        if (h["rain"][i] or 0) >= 0.2:
+            return "rain", "Il pleut en ce moment" if i == 0 else f"Pluie attendue vers {hhmm(t[i])}"
+    gi = max(range(min(12, len(t))), key=lambda i: h["gust"][i] or 0)
+    if (h["gust"][gi] or 0) >= 50 or max(h["wind"][:12]) >= 35:
+        return "wind", f"Rafales jusqu'à {round(h['gust'][gi])} km/h vers {hhmm(t[gi])}"
+    air = h.get("air") or []
+    ai = max(range(min(12, len(air))), key=lambda i: air[i] or 0, default=None)
+    if ai is not None and (air[ai] or 0) >= 60:
+        return "air", f"Qualité de l'air {aqi_label(air[ai]).lower()} vers {hhmm(t[ai])}"
+    hi = max(range(len(t)), key=lambda i: h["temp"][i])
+    lo = min(range(len(t)), key=lambda i: h["temp"][i])
+    if h["temp"][hi] >= 30:
+        return "temp", f"Fortes chaleurs : {round(h['temp'][hi])}° vers {hhmm(t[hi])}"
+    if h["temp"][lo] <= 0:
+        return "temp", f"Gel : {round(h['temp'][lo])}° vers {hhmm(t[lo])}"
+    return "temp", ""
+
+try:
+    loc = json.loads(LOC.read_text())
+except Exception:
+    print(json.dumps({"error": "Ville non configurée"}))
+    sys.exit()
+
+try:
+    cache = json.loads(CACHE.read_text())
+    if cache.get("name") != loc["name"]:
+        cache = {}
+except Exception:
+    cache = {}
+now = time.time()
+dirty = False
+
+if now - cache.get("fetched", 0) > GRID_TTL or "air" not in cache.get("grid", {}):
+    try:
+        cache.update(fetch_grid(loc), name=loc["name"], lat=loc["lat"], lon=loc["lon"])
+        cache["relevant"], cache["reason"] = relevance(cache)
+        cache.pop("stale", None)
+        write_atlas(cache)
+        dirty = True
+    except Exception as e:
+        if "grid" not in cache:
+            print(json.dumps({"error": f"Carte météo indisponible : {e}"}))
+            sys.exit()
+        cache["stale"] = True
+
+if now - cache.get("radarFetched", 0) > RADAR_TTL:
+    try:
+        r = get("https://api.rainviewer.com/public/weather-maps.json")
+        cache["radar"] = {"host": r["host"], "frames": [{"time": f["time"], "path": f["path"]} for f in r["radar"]["past"]]}
+        cache["radarFetched"] = now
+        dirty = True
+    except Exception:
+        pass
+
+if "grid" in cache and not Path(cache.get("atlas", "/nonexistent")).exists():
+    write_atlas(cache)
+    dirty = True
+
+if dirty:
+    CACHE.write_text(json.dumps(cache))
+print(json.dumps(cache))

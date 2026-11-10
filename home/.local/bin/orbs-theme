@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Dessine les orbes thinking-orbs (thinkingorbs.com, MIT) aux couleurs Pywal, en GIF animés pour Vicinae.
+
+Entrée : les boucles exportées par export.mjs dans ~/.local/share/thinking-orbs/<état>.json
+         (positions, rayons et opacités des points, image par image, pour un orbe de 20 px).
+Sortie : ~/.cache/wal/orbs/<état>.gif (180 px, vues Detail) et <état>-48.gif (48 px, vues vides).
+
+Vicinae n'anime que les GIF, dont la transparence est binaire : chaque point est donc peint dans la
+couleur d'accent déjà mélangée au fond Pywal selon son opacité, ce qui garde l'effet de profondeur.
+Appelé par hypr-wallpaper après Pywal ; à la main : orbs-theme [--force]
+"""
+import json, os, sys
+from pathlib import Path
+from PIL import Image, ImageDraw
+
+SRC = Path.home() / ".local/share/thinking-orbs"
+OUT = Path.home() / ".cache/wal/orbs"
+WAL = Path.home() / ".cache/wal/colors.json"
+SIZES = {"": 180, "-48": 48}
+SS = 4  # suréchantillonnage
+
+
+def hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def render(data, px, accent, bg):
+    k = px * SS / data["size"]
+    frames = []
+    for f in data["frames"]:
+        # Peint du plus transparent au plus opaque : les points de devant passent par-dessus.
+        dots = sorted((f[i:i + 4] for i in range(0, len(f), 4)), key=lambda d: d[3])
+        im = Image.new("RGBA", (px * SS, px * SS), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(im)
+        for x, y, r, a in dots:
+            a = min(1.0, a * 1.15)
+            col = tuple(round(bg[j] + (accent[j] - bg[j]) * a) for j in range(3))
+            x, y, r = x * k, y * k, max(r * k, SS * 0.9)
+            dr.ellipse((x - r, y - r, x + r, y + r), fill=col + (255,))
+        im = im.resize((px, px), Image.LANCZOS)
+        # Transparence binaire du GIF : seuil sur l'alpha lissé.
+        alpha = im.getchannel("A").point(lambda v: 255 if v >= 110 else 0)
+        rgb = im.convert("RGB")
+        frames.append((rgb, alpha))
+    return frames
+
+
+def save_gif(frames, path, fps):
+    out = []
+    for rgb, alpha in frames:
+        p = rgb.quantize(colors=255, method=Image.Quantize.MEDIANCUT)
+        # L'index 255 sert de couleur transparente.
+        p.putpalette(p.getpalette()[:765] + [0, 0, 0])
+        mask = alpha.point(lambda v: 255 if v == 0 else 0)
+        p.paste(255, mask=mask)
+        out.append(p)
+    tmp = path.with_suffix(".tmp.gif")
+    out[0].save(tmp, save_all=True, append_images=out[1:], duration=round(1000 / fps), loop=0,
+                disposal=2, transparency=255, optimize=False)
+    os.replace(tmp, path)
+
+
+def main():
+    force = "--force" in sys.argv
+    wal = json.loads(WAL.read_text())
+    accent, bg = hex_rgb(wal["colors"]["color4"]), hex_rgb(wal["special"]["background"])
+    stamp = f"{wal['colors']['color4']} {wal['special']['background']}"
+    OUT.mkdir(parents=True, exist_ok=True)
+    marker = OUT / ".colors"
+    if not force and marker.exists() and marker.read_text() == stamp:
+        return
+    for src in sorted(SRC.glob("*.json")):
+        data = json.loads(src.read_text())
+        for suffix, px in SIZES.items():
+            save_gif(render(data, px, accent, bg), OUT / f"{src.stem}{suffix}.gif", data["fps"])
+    marker.write_text(stamp)
+
+
+if __name__ == "__main__":
+    main()

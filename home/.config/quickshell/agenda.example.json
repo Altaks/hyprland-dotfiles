@@ -1,0 +1,6 @@
+{
+  "calendars": [
+    {"name": "Perso", "url": "https://calendar.google.com/calendar/ical/.../private-.../basic.ics", "color": "#8aadf4"},
+    {"name": "Jours fériés", "url": "https://calendar.google.com/calendar/ical/fr.french%23holiday%40group.v.calendar.google.com/public/basic.ics", "color": "#a6da95"}
+  ]
+}

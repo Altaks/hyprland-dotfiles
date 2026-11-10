@@ -1,0 +1,187 @@
+#!@HOME@/.local/share/dashboard-venv/bin/python
+"""Transports Naolib (Nantes) pour le tableau de bord Quickshell (onglet Nantes).
+
+Horaires théoriques du jour (naolib-build day) corrigés par les retards GTFS-RT d'api.okina.fr
+(flux sans clé, limité à 1 requête / 30 s : trip-updates relu au plus toutes les 30 s, alertes toutes les 2 min).
+Config: ~/.config/quickshell/naolib.json {"stops": ["Commerce", …]} (noms d'arrêts GTFS).
+  naolib-fetch --find motif   → cherche un nom d'arrêt
+  naolib-fetch --set "Nom" …  → choisit les arrêts suivis
+Output: one JSON document on stdout
+  {"stops": [{"name", "lines": [{"line", "color", "text", "type", "headsign", "times": [{"ts", "rt"}]}]}],
+   "alerts": [{"title", "desc", "lines": [{"line", "color", "text"}], "start", "end", "mine"}],
+   "vehicles": [{"line", "color", "text", "type", "headsign", "rt", "p": [[ts, lat, lon, "arrêt"], …]}], "ts"}
+La carte interpole la position de chaque véhicule entre deux points de « p » (le flux GPS Naolib est vide).
+Données statiques (index, horaires du jour, fond de carte) : naolib-build, dans ~/.cache/dashboard-naolib/.
+"""
+import html, json, re, subprocess, sys, time, urllib.request
+from datetime import datetime
+from pathlib import Path
+
+from google.transit import gtfs_realtime_pb2
+
+DIR = Path.home() / ".cache/dashboard-naolib"
+CONFIG = Path.home() / ".config/quickshell/naolib.json"
+BUILD = Path.home() / ".local/bin/naolib-build"
+RT = "https://api.okina.fr/gateway/semgtfsrt/realtime/{}/NAOLIBORG"
+TTL = {"trip-updates": 30, "alerts": 120}
+HORIZON = 90 * 60
+MAX_TIMES = 3
+
+
+def config():
+    try:
+        return json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def fresh(path, age):
+    return path.exists() and time.time() - path.stat().st_mtime < age
+
+
+def static():
+    """index (hebdo) et horaires du jour (quotidien, ou si les arrêts suivis changent) ; fond de carte en tâche de fond."""
+    if not fresh(DIR / "index.json", 7 * 86400):
+        subprocess.run([str(BUILD), "index"], check=True)
+    try:
+        day = json.loads((DIR / "day.json").read_text())
+    except (OSError, ValueError):
+        day = {}
+    if day.get("date") != datetime.now().strftime("%Y%m%d") or day.get("stops") != sorted(config().get("stops", [])):
+        subprocess.run([str(BUILD), "day"], check=True)
+        day = json.loads((DIR / "day.json").read_text())
+    if not fresh(DIR / "map.json", 30 * 86400):
+        subprocess.Popen([str(BUILD), "map"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return json.loads((DIR / "index.json").read_text()), day
+
+
+def feed(kind):
+    """Flux GTFS-RT, mis en cache sur disque. L'API limite à 1 requête / 30 s tous flux confondus :
+    on n'appelle que si aucun flux n'a été demandé depuis 31 s (les horaires passent avant les alertes)."""
+    path, last = DIR / f"rt-{kind}.pb", DIR / "rt-last"
+    busy = fresh(last, 31)
+    if kind == "alerts" and path.exists() and not fresh(DIR / "rt-trip-updates.pb", TTL["trip-updates"] - 5):
+        busy = True  # le prochain créneau revient aux horaires
+    if not fresh(path, TTL[kind]) and not (busy and path.exists()):
+        last.touch()
+        try:
+            req = urllib.request.Request(RT.format(kind), headers={"User-Agent": "Mozilla/5.0 (dashboard naolib)"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data = r.read()
+            path.write_bytes(data)
+        except Exception:
+            if not path.exists():
+                raise
+    f = gtfs_realtime_pb2.FeedMessage()
+    f.ParseFromString(path.read_bytes())
+    return f
+
+
+def line_info(idx, route_id):
+    r = idx["routes"].get(route_id)
+    return {"line": r[0], "color": "#" + r[1], "text": "#" + r[2], "type": r[3]} if r else \
+        {"line": route_id.split(":")[-1], "color": "#888888", "text": "#ffffff", "type": 3}
+
+
+def text(ts):
+    return ts.translation[0].text if ts.translation else ""
+
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--find"]:
+        DIR.mkdir(parents=True, exist_ok=True)
+        if not (DIR / "index.json").exists():
+            subprocess.run([str(BUILD), "index"], check=True)
+        idx = json.loads((DIR / "index.json").read_text())
+        pat = " ".join(args[1:]).lower()
+        print("\n".join(sorted({v[0] for k, v in idx["stops"].items() if "StopPlace" in k and pat in v[0].lower()})) or "Aucun arrêt")
+        return
+    if args[:1] == ["--set"]:
+        CONFIG.write_text(json.dumps({**config(), "stops": args[1:]}, ensure_ascii=False))
+
+    DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        idx, day = static()
+        trips = feed("trip-updates")
+    except Exception as e:
+        print(json.dumps({"error": str(e)[:200]}))
+        return
+    now = time.time()
+
+    # Retards par course : [(numéro d'arrêt, retard)] ; un retard vaut pour les arrêts suivants
+    delays, skipped = {}, set()
+    for ent in trips.entity:
+        tu = ent.trip_update
+        ups = []
+        for u in tu.stop_time_update:
+            if u.schedule_relationship == 1:  # SKIPPED
+                skipped.add((tu.trip.trip_id, u.stop_sequence))
+            ev = u.departure if u.HasField("departure") else u.arrival
+            ups.append((u.stop_sequence, ev.delay))
+        delays[tu.trip.trip_id] = sorted(ups)
+
+    def adjusted(trip_id, seq, ts):
+        d = 0
+        for useq, dl in delays.get(trip_id, []):
+            if useq <= seq:
+                d = dl
+            else:
+                break
+        return ts + d
+
+    # Prochains passages aux arrêts suivis
+    groups = {}
+    for stop, trip_id, route_id, headsign, seq, ts in day.get("deps", []):
+        if (trip_id, seq) in skipped:
+            continue
+        t = adjusted(trip_id, seq, ts)
+        if now - 30 <= t <= now + HORIZON:
+            groups.setdefault((stop, route_id, headsign), []).append({"ts": t, "rt": trip_id in delays})
+    stops = []
+    for name in config().get("stops", []):
+        lines = [{**line_info(idx, r), "headsign": h, "times": sorted(ts, key=lambda x: x["ts"])[:MAX_TIMES]}
+                 for (s, r, h), ts in groups.items() if s == name]
+        lines.sort(key=lambda l: (l["type"] != 0, len(l["line"]), l["line"], l["times"][0]["ts"]))
+        stops.append({"name": name, "lines": lines})
+    my_lines = {l["line"] for s in stops for l in s["lines"]}
+
+    # Véhicules des lignes structurantes : points proches de maintenant, retards appliqués
+    vehicles = []
+    for trip_id, t in day.get("trips", {}).items():
+        st = t["st"]
+        if adjusted(trip_id, st[0][0], st[0][1]) > now + 60 or adjusted(trip_id, st[-1][0], st[-1][1]) < now - 60:
+            continue
+        pts = [[adjusted(trip_id, seq, ts), lat, lon, name] for seq, ts, lat, lon, name in st]
+        i0 = max([i for i, p in enumerate(pts) if p[0] <= now - 120] or [0])
+        i1 = min([i for i, p in enumerate(pts) if p[0] >= now + 900] or [len(pts) - 1])
+        vehicles.append({**line_info(idx, t["route"]), "headsign": t["headsign"], "rt": trip_id in delays,
+                         "p": pts[i0:i1 + 1]})
+
+    # Info trafic
+    alerts = []
+    try:
+        for ent in feed("alerts").entity:
+            a = ent.alert
+            periods = [(p.start, p.end) for p in a.active_period] or [(0, 0)]
+            active = [p for p in periods if (not p[0] or p[0] <= now + 86400) and (not p[1] or p[1] >= now)]
+            if not active:
+                continue
+            lines = [line_info(idx, r) for r in dict.fromkeys(ie.route_id for ie in a.informed_entity if ie.route_id)]
+            desc = html.unescape(re.sub(r"<[^>]+>", " ", text(a.description_text)))
+            desc = " ".join(desc.split())
+            title = text(a.header_text).strip() or re.split(r"(?<=[.!:])\s", desc, maxsplit=1)[0][:120]
+            if not title:
+                continue
+            alerts.append({"title": title, "desc": desc[:500], "lines": lines,
+                           "start": active[0][0], "end": active[0][1],
+                           "mine": any(l["line"] in my_lines for l in lines)})
+        alerts.sort(key=lambda a: (not a["mine"], -(a["start"] or 0)))
+    except Exception:
+        pass
+
+    print(json.dumps({"stops": stops, "alerts": alerts, "vehicles": vehicles, "ts": int(now)}))
+
+
+if __name__ == "__main__":
+    main()

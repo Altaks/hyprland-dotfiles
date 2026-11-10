@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Bord gauche (x relatif à l'écran) de la pilule Waybar sous la souris.
+
+Waybar ne publie pas la position de ses modules : on photographie une ligne de la barre
+(grim) juste sous la bordure du haut, au-dessus du texte, et on part de la souris vers la
+gauche tant que la couleur reste celle du fond de la pilule. Usage : waybar-pill-left [x]
+"""
+import json
+import subprocess
+import sys
+
+ROW = 10          # margin-top 6 + bordure 2 + 2 px : dans la pilule, au-dessus du texte
+EDGE = 6          # bordure (2 px + anticrénelage) + décalage de l'arrondi (radius 12) à cette hauteur
+JUMP = 40         # saut de couleur entre deux pixels voisins qui marque la bordure (le fond à 85 %
+                  # laisse transparaître le fond d'écran : dégradé doux, mais pas de saut)
+
+cursor = json.loads(subprocess.run(["hyprctl", "-j", "cursorpos"], capture_output=True, text=True).stdout)
+monitors = json.loads(subprocess.run(["hyprctl", "-j", "monitors"], capture_output=True, text=True).stdout)
+x = int(sys.argv[1]) if len(sys.argv) > 1 else cursor["x"]
+mon = next((m for m in monitors if m["x"] <= x < m["x"] + m["width"]
+            and m["y"] <= cursor["y"] < m["y"] + m["height"]), monitors[0])
+ppm = subprocess.run(["grim", "-t", "ppm", "-g", f"{mon['x']},{mon['y'] + ROW} {mon['width']}x1", "-"],
+                     capture_output=True).stdout
+# En-tête PPM « P6\n<w> <h>\n255\n » puis RGB brut
+data = ppm.split(b"\n", 3)[3]
+px = [tuple(data[i:i + 3]) for i in range(0, len(data) - 2, 3)]
+
+local = x - mon["x"]
+left = local
+while left > 0 and sum(abs(a - b) for a, b in zip(px[left - 1], px[left])) <= JUMP:
+    left -= 1
+print(max(0, left - EDGE))

@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Super+Shift+H / V: put the focused tile side by side (h) or stacked (v) with its neighbour.
+
+Dwindle only has `togglesplit`, and Hyprland does not tell the current direction of a split:
+it is guessed from the geometry (the sibling of the focused tile shares its whole edge),
+then toggled only if it is not already the requested one.
+  hypr-split h|v
+"""
+import json, subprocess, sys
+
+TOL = 3
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+def shares_edge(win, others, axis):
+    """True if the tiles touching one side of `win` along `axis` span exactly its other dimension."""
+    a, b = (0, 1) if axis == "x" else (1, 0)   # a = axis of the split, b = shared dimension
+    lo, hi = win["at"][b], win["at"][b] + win["size"][b]
+    start, end = win["at"][a], win["at"][a] + win["size"][a]
+    for side in ("after", "before"):
+        if side == "after":
+            touch = [o for o in others if 0 <= o["at"][a] - end <= 40]
+        else:
+            touch = [o for o in others if 0 <= start - (o["at"][a] + o["size"][a]) <= 40]
+        # Only tiles facing this window
+        touch = [o for o in touch if o["at"][b] < hi and o["at"][b] + o["size"][b] > lo]
+        if touch and abs(min(o["at"][b] for o in touch) - lo) <= TOL \
+                and abs(max(o["at"][b] + o["size"][b] for o in touch) - hi) <= TOL:
+            return True
+    return False
+
+want = sys.argv[1] if len(sys.argv) > 1 else ""
+if want not in ("h", "v"):
+    sys.exit("usage: hypr-split h|v")
+win = json.loads(hyprctl("-j", "activewindow") or "{}")
+if not win.get("address") or win["floating"]:
+    sys.exit(0)
+others = [c for c in json.loads(hyprctl("-j", "clients"))
+          if c["workspace"]["id"] == win["workspace"]["id"] and c["address"] != win["address"]
+          and c["mapped"] and not c["floating"] and not c["hidden"]]
+if not others:
+    sys.exit(0)
+horizontal = shares_edge(win, others, "x")
+vertical = shares_edge(win, others, "y")
+current = "h" if horizontal and not vertical else "v" if vertical and not horizontal else None
+if current != want:
+    hyprctl("dispatch", "layoutmsg", "togglesplit")

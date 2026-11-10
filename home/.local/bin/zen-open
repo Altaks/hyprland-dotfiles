@@ -1,0 +1,13 @@
+#!/bin/sh
+# Ouvre un lien dans Zen depuis n'importe quelle appli, y compris une AppImage (Prism Launcher…)
+# qui transmet son propre environnement : XDG_DATA_HOME vide, XDG_DATA_DIRS pointant dans son
+# AppImage, thème Qt changé. AppImageLauncher s'y perd et affiche une erreur vide au lieu de
+# lancer Zen, d'où l'environnement de session remis à plat et APPIMAGELAUNCHER_DISABLE.
+[ -z "$XDG_DATA_HOME" ] && unset XDG_DATA_HOME
+[ -z "$XDG_CONFIG_HOME" ] && unset XDG_CONFIG_HOME
+[ -z "$XDG_CACHE_HOME" ] && unset XDG_CACHE_HOME
+export XDG_DATA_DIRS="$HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/:/var/lib/snapd/desktop"
+export QT_QPA_PLATFORMTHEME=qt6ct
+unset APPDIR APPIMAGE ARGV0 OWD SHARUN_DIR LD_LIBRARY_PATH QT_PLUGIN_PATH
+export APPIMAGELAUNCHER_DISABLE=1
+exec "$HOME/Applications/zen_7b3f2b5fc3e05213e1c40baed63ec516.AppImage" "$@"

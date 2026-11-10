@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Mises à jour disponibles pour le tableau de bord Quickshell (onglet Mises à jour).
+
+Output: one JSON document on stdout
+  {"sources": [{"id", "name", "count", "items": [{"name", "from", "to", "security"}], "error"?}],
+   "reboot": bool, "aptAge": ts des listes apt, "ts"}
+Sources : apt (listes rafraîchies par apt-daily), snap, flatpak, Homebrew (brew update au plus
+toutes les 6 h), firmware (fwupd), Zen Browser (AppImage vs dernière release GitHub).
+Cached 30 min in ~/.cache/dashboard-updates.json (`updates-fetch --force` pour ignorer le cache).
+Installer = ~/.local/bin/sys-update [source…] (dans un terminal, demande sudo).
+"""
+import json, os, re, subprocess, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+CACHE = Path.home() / ".cache/dashboard-updates.json"
+BREW_STAMP = Path.home() / ".cache/dashboard-updates.brew-stamp"
+TTL = 1800
+BREW = "/home/linuxbrew/.linuxbrew/bin/brew"
+
+
+def run(*cmd, timeout=120, env=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, **(env or {})})
+    return r.stdout
+
+
+def apt():
+    items = []
+    for line in run("apt", "list", "--upgradable").splitlines():
+        m = re.match(r"(\S+?)/(\S+) (\S+) \S+ \[(?:upgradable from|pouvant être mis à jour depuis) ?: (\S+)\]", line)
+        if m:
+            items.append({"name": m[1], "to": m[3], "from": m[4], "security": "-security" in m[2]})
+    return items
+
+
+def snap():
+    items = []
+    for line in run("snap", "refresh", "--list").splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 2:
+            items.append({"name": f[0], "to": f[1], "from": ""})
+    return items
+
+
+def flatpak():
+    return [{"name": f[0], "to": f[1] if len(f) > 1 else "", "from": ""}
+            for f in (l.split("\t") for l in run("flatpak", "remote-ls", "--updates", "--columns=application,version").splitlines())
+            if f[0]]
+
+
+def brew(force):
+    env = {"HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ENV_HINTS": "1"}
+    try:
+        age = time.time() - BREW_STAMP.stat().st_mtime
+    except OSError:
+        age = 1e9
+    if force or age > 6 * 3600:
+        run(BREW, "update", "--quiet", timeout=180, env=env)
+        BREW_STAMP.touch()
+    data = json.loads(run(BREW, "outdated", "--json=v2", env=env) or "{}")
+    return [{"name": p["name"], "from": (p.get("installed_versions") or [""])[-1], "to": p.get("current_version", "")}
+            for p in data.get("formulae", []) + data.get("casks", [])]
+
+
+def firmware():
+    data = json.loads(run("fwupdmgr", "get-updates", "--json", timeout=60) or "{}")
+    items = []
+    for d in data.get("Devices", []):
+        rel = (d.get("Releases") or [{}])[0]
+        items.append({"name": d.get("Name", "?"), "from": d.get("Version", ""), "to": rel.get("Version", "")})
+    return items
+
+
+def zen():
+    apps = sorted(Path.home().glob("Applications/zen*.AppImage"))
+    if not apps:
+        return []
+    # zen-version lit la version sans lancer l'AppImage (le --version direct bloquait parfois > 30 s)
+    cur = run(str(Path.home() / ".local/bin/zen-version"), timeout=30).strip()
+    req = urllib.request.Request("https://api.github.com/repos/zen-browser/desktop/releases/latest",
+                                 headers={"User-Agent": "dashboard-updates"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        latest = json.load(r)["tag_name"]
+    cur = cur or "?"
+    return [] if cur == latest else [{"name": "Zen Browser", "from": cur, "to": latest}]
+
+
+SOURCES = [("apt", "Ubuntu (apt)"), ("snap", "Snap"), ("flatpak", "Flatpak"),
+           ("brew", "Homebrew"), ("firmware", "Firmware"), ("zen", "Zen Browser")]
+
+
+def main():
+    force = "--force" in sys.argv
+    try:
+        cached = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        cached = None
+    if cached and not force and time.time() - cached.get("ts", 0) < TTL:
+        print(json.dumps(cached))
+        return
+    funcs = {"apt": apt, "snap": snap, "flatpak": flatpak, "brew": lambda: brew(force),
+             "firmware": firmware, "zen": zen}
+    sources = []
+    with ThreadPoolExecutor(len(SOURCES)) as pool:
+        futs = [(sid, name, pool.submit(funcs[sid])) for sid, name in SOURCES]
+        for sid, name, fut in futs:
+            try:
+                items = fut.result()
+                sources.append({"id": sid, "name": name, "count": len(items), "items": items})
+            except Exception as e:
+                old = next((s for s in (cached or {}).get("sources", []) if s["id"] == sid), None)
+                sources.append({**(old or {"id": sid, "name": name, "count": 0, "items": []}), "error": str(e)[:200]})
+    try:
+        apt_age = int(Path("/var/lib/apt/periodic/update-success-stamp").stat().st_mtime)
+    except OSError:
+        apt_age = 0
+    out = {"sources": sources, "reboot": Path("/var/run/reboot-required").exists(),
+           "aptAge": apt_age, "ts": int(time.time())}
+    CACHE.write_text(json.dumps(out))
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()

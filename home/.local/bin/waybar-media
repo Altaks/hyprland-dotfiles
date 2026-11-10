@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Pilule « musique en cours » de Waybar (module custom/media, une ligne JSON par changement).
+
+Interroge tous les lecteurs chaque seconde : ceux qui jouent passent avant ceux en pause, et Twitch
+passe avant le reste (Spotify en fond ne le masque pas). Remplace le module mpris de Waybar, qui ne
+voit qu'un lecteur « firefox » pour Twitch : ici la source est reconnue à l'URL.
+"""
+import html
+import json
+import re
+import subprocess
+import time
+import unicodedata
+
+FMT = "\t".join("{{%s}}" % k for k in ("playerName", "status", "title", "artist", "xesam:url", "mpris:length"))
+MAX = 48
+
+
+def source(url, length):
+    if re.match(r"https?://([a-z]+\.)?twitch\.tv/", url):
+        return "󰕃", "Twitch", "/videos/" not in url
+    if "open.spotify.com" in url:
+        return "󰓇", "Spotify", False
+    if re.match(r"https?://(www\.|music\.)?youtube\.com/|https?://youtu\.be/", url):
+        return "󰗃", "YouTube", length > 1e15
+    return "󰎆", "Lecteur", length > 1e15
+
+
+# Crochets CJK, guillemets pleine chasse… → ASCII : ces glyphes viennent d'une police de secours
+# plus haute que CaskaydiaCove, qui décale le texte de la pilule vers le bas.
+FULLWIDTH = str.maketrans({"「": "[", "」": "]", "『": "[", "』": "]", "【": "[", "】": "]", "〔": "[", "〕": "]",
+                           "《": "«", "》": "»", "〈": "<", "〉": ">", "！": "!", "？": "?", "～": "~", "♥": "♥", "　": " "})
+
+
+def clean(s):
+    """Retire émojis et symboles décoratifs (catégorie So, sélecteurs de variante, ZWJ) et tasse les espaces."""
+    s = unicodedata.normalize("NFKC", s.translate(FULLWIDTH))
+    s = "".join(c for c in s if unicodedata.category(c) not in ("So", "Cf", "Cs", "Co", "Mn") or c in "♥")
+    s = re.sub(r"\[\s*\]|\(\s*\)", "", s)          # crochets vidés par le nettoyage
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\[ ", "[", re.sub(r" \]", "]", s)).strip(" -|·")
+    return s
+
+
+def pick(raws, previous):
+    """Joue > pause, puis Twitch > autres, puis le lecteur déjà affiché (évite de clignoter)."""
+    rows = [r.split("\t") for r in raws]
+    rows = [r for r in rows if len(r) >= 6 and r[1] in ("Playing", "Paused")]
+    if not rows:
+        return None
+    return max(rows, key=lambda r: (r[1] == "Playing", "twitch.tv/" in r[4], r[0] == previous))
+
+
+def line(row):
+    if not row:
+        return {"text": "", "tooltip": ""}
+    status, title, artist, url, length = row[1:6]
+    try:
+        length = int(length or 0)
+    except ValueError:
+        length = 0
+    icon, name, live = source(url, length)
+    # Twitch : la chaîne d'abord (les titres de stream sont longs et seraient coupés avant)
+    order = (clean(artist), clean(title)) if name == "Twitch" else (clean(title), clean(artist))
+    text = " · ".join(x for x in order if x) or name
+    if len(text) > MAX:
+        text = text[:MAX - 1].rstrip(" ,·-") + "…"
+    text = html.escape(text)
+    if status == "Paused":
+        icon = "󰏤"
+    else:
+        if name == "Twitch":
+            icon = f"<span color='#9146ff'>{icon}</span>"
+        if live:
+            text += "  <span color='#eb0400'>●</span>"
+    tip = f"{name}{' (en direct)' if live else ''} : {title}" + (f" — {artist}" if artist else "")
+    cls = [status.lower(), name.lower()] + (["live"] if live else [])
+    return {"text": f"{icon}  {text}", "tooltip": tip + "\nClic : ouvrir le lecteur", "class": cls}
+
+
+shown, last = None, None
+while True:
+    out = subprocess.run(["playerctl", "-a", "metadata", "--format", FMT],
+                         capture_output=True, text=True).stdout
+    row = pick(out.splitlines(), shown)
+    shown = row[0] if row else None
+    msg = json.dumps(line(row), ensure_ascii=False)
+    if msg != last:
+        print(msg, flush=True)
+        last = msg
+    time.sleep(1)

@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""One JSON snapshot of system stats for the Quickshell « vitals » panel.
+
+Rates (CPU usage, network) are measured over a short 0.4 s window.
+Claude usage comes from claude-usage-waybar's cache: no API call here.
+"""
+import json, os, shutil, subprocess, time
+from pathlib import Path
+
+def read(path, default=""):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+def cpu_times():
+    """(total, idle) for the whole CPU then for each logical core (cpu0, cpu1, …)."""
+    out = []
+    for line in read("/proc/stat").splitlines():
+        if not line.startswith("cpu"):
+            break
+        vals = list(map(int, line.split()[1:]))
+        out.append((sum(vals), vals[3] + vals[4]))
+    return out
+
+def usage(a, b):
+    return round(100 * (1 - (b[1] - a[1]) / max(1, b[0] - a[0])))
+
+def net_bytes():
+    rx = tx = 0
+    for line in read("/proc/net/dev").splitlines()[2:]:
+        name, data = line.split(":", 1)
+        name = name.strip()
+        if name == "lo" or name.startswith(("br-", "docker", "veth", "virbr")):
+            continue
+        cols = data.split()
+        rx += int(cols[0]); tx += int(cols[8])
+    return rx, tx
+
+def hwmon(name, sensor="temp1_input"):
+    for h in Path("/sys/class/hwmon").iterdir():
+        if read(h / "name") == name:
+            v = read(h / sensor)
+            if v:
+                return round(int(v) / 1000)
+    return None
+
+def nvme_temps():
+    temps = []
+    for h in sorted(Path("/sys/class/hwmon").iterdir()):
+        if read(h / "name") == "nvme":
+            v = read(h / "temp1_input")
+            if v:
+                temps.append(round(int(v) / 1000))
+    return temps
+
+c0 = cpu_times(); n0 = net_bytes(); s0 = time.monotonic()
+time.sleep(0.4)
+c1 = cpu_times(); n1 = net_bytes(); dt = time.monotonic() - s0
+
+mem = {}
+for line in read("/proc/meminfo").splitlines():
+    k, v = line.split(":", 1)
+    mem[k] = int(v.split()[0]) * 1024
+
+freqs = [int(read(p)) for p in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_cur_freq") if read(p)]
+
+gpu = None
+try:
+    out = subprocess.run(["nvidia-smi", "--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total,power.draw,fan.speed",
+                          "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3).stdout.strip()
+    name, util, temp, vused, vtotal, power, fan = [x.strip() for x in out.split(",")]
+    gpu = {"name": name.replace("NVIDIA GeForce ", ""), "usage": int(util), "temp": int(temp),
+           "vramUsed": int(vused) / 1024, "vramTotal": int(vtotal) / 1024,
+           "power": round(float(power)), "fan": int(fan) if fan.isdigit() else None}
+except Exception:
+    pass
+
+disk = shutil.disk_usage("/")
+claude = None
+try:
+    data = json.loads((Path.home() / ".cache/claude-usage-waybar.json").read_text()).get("data") or {}
+    claude = {k: round(float(data[k]["utilization"])) for k in ("five_hour", "seven_day")
+              if (data.get(k) or {}).get("utilization") is not None}
+except Exception:
+    pass
+# Tokens used + API-price equivalent (claude-tokens keeps its own 60 s cache)
+try:
+    tokens = json.loads(subprocess.run([str(Path.home() / ".local/bin/claude-tokens")],
+                                       capture_output=True, text=True, timeout=10).stdout)
+    if claude is not None:
+        claude["tokens"] = {k: {"tokens": tokens[k]["tokens"], "cost": tokens[k]["cost"]} for k in ("session", "week")}
+except Exception:
+    pass
+
+uptime = float(read("/proc/uptime", "0").split()[0])
+cpu_name = next((l.split(":", 1)[1].strip() for l in read("/proc/cpuinfo").splitlines() if l.startswith("model name")), "")
+print(json.dumps({
+    "cpu": {
+        "usage": usage(c0[0], c1[0]),
+        "perCore": [usage(a, b) for a, b in zip(c0[1:], c1[1:])],
+        "temp": hwmon("k10temp"),
+        "freq": round(sum(freqs) / len(freqs) / 1e6, 2) if freqs else None,
+        "cores": os.cpu_count(),
+        "load": [round(x, 2) for x in os.getloadavg()],
+        "name": cpu_name.replace(" 8-Core Processor", "").replace("AMD ", ""),
+    },
+    "mem": {
+        "used": (mem["MemTotal"] - mem["MemAvailable"]) / 2**30,
+        "total": mem["MemTotal"] / 2**30,
+        "swapUsed": (mem["SwapTotal"] - mem["SwapFree"]) / 2**30,
+        "swapTotal": mem["SwapTotal"] / 2**30,
+    },
+    "gpu": gpu,
+    "disk": {"used": disk.used / 2**30, "total": disk.total / 2**30, "nvmeTemps": nvme_temps()},
+    "net": {"down": (n1[0] - n0[0]) / dt, "up": (n1[1] - n0[1]) / dt, "totalDown": n1[0], "totalUp": n1[1]},
+    "claude": claude,
+    "uptime": uptime,
+}))

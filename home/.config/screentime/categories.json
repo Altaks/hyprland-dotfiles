@@ -1,0 +1,93 @@
+{
+  "_doc": "Règles évaluées dans l'ordre ; la première qui correspond gagne. app/title/domains = regex Python (insensible à la casse) sur la classe de fenêtre / le titre / le domaine de l'onglet (extension aw-watcher-web). Pour un navigateur : domaine d'abord, puis titre, sinon 'web'. 'names' = nom affiché par classe. 'icons' = icône forcée par classe. media_max_idle_minutes : un onglet qui joue du son au premier plan compte comme actif (pas AFK) pendant au plus ce délai après la dernière action clavier/souris.",
+  "categories": [
+    {
+      "id": "social",
+      "name": "Réseaux sociaux",
+      "color": "#8aadf4",
+      "app": "discord|vesktop|telegram|signal|whatsapp|slack|teams|mumble",
+      "title": "discord|twitter|\\bx\\.com|reddit|instagram|facebook|linkedin|bluesky|mastodon|whatsapp|messenger|gmail|outlook",
+      "domains": "discord\\.com|twitter\\.com|^x\\.com|reddit\\.com|instagram\\.com|facebook\\.com|linkedin\\.com|bsky\\.app|mastodon|web\\.whatsapp\\.com|messenger\\.com|web\\.telegram\\.org|mail\\.google\\.com|outlook\\.(live|office)\\.com|mail\\.proton\\.me"
+    },
+    {
+      "id": "fun",
+      "name": "Divertissement",
+      "color": "#f5a97f",
+      "app": "spotify|mpv|vlc|celluloid|totem|stremio",
+      "title": "youtube|twitch|netflix|prime video|disney\\+|crunchyroll|spotify|deezer|anime",
+      "domains": "youtube\\.com|youtu\\.be|twitch\\.tv|netflix\\.com|primevideo\\.com|disneyplus\\.com|crunchyroll\\.com|open\\.spotify\\.com|deezer\\.com|9gag|tiktok\\.com|kick\\.com|animationdigitalnetwork|canalplus|molotov"
+    },
+    {
+      "id": "games",
+      "name": "Jeux",
+      "color": "#ed8796",
+      "app": "minecraft.*|prismlauncher|lunarclient|steam|steam_app_.*|lutris|heroic|gamescope|.*\\.exe",
+      "title": "",
+      "domains": "chess\\.com|lichess\\.org|store\\.steampowered\\.com|steamcommunity\\.com|itch\\.io|epicgames\\.com|namemc\\.com"
+    },
+    {
+      "id": "dev",
+      "name": "Développement",
+      "color": "#a6da95",
+      "app": "jetbrains-.*|code|code-oss|cursor|dev\\.zed\\.zed|zed|antigravity|org\\.gnome\\.ptyxis|kitty|alacritty|foot|wezterm|com\\.mitchellh\\.ghostty|datagrip|mongodb compass|realm studio|termius|docker.*|postman|insomnia|opencode|orca",
+      "title": "github|gitlab|stack ?overflow|localhost|127\\.0\\.0\\.1|docs?\\.|documentation|mdn|claude|chatgpt|npm|crates\\.io|pypi|api reference|pull requests?\\b|· [\\w.-]+/[\\w.-]+(@[0-9a-f]{7}| —|$)|\\bcommits\\b|actions usage|gitbook|\\| developers|^[\\w.-]+/[\\w.-]+: ",
+      "domains": "github\\.com|gitlab\\.com|githubusercontent\\.com|stackoverflow\\.com|stackexchange\\.com|^localhost$|^127\\.0\\.0\\.1$|developer\\.mozilla\\.org|claude\\.ai|chatgpt\\.com|npmjs\\.com|crates\\.io|pypi\\.org|docs\\.|\\.readthedocs\\.io|gitbook\\.io|spigotmc\\.org|papermc\\.io|modrinth\\.com|docker\\.com|vercel\\.com|cloudflare\\.com|console\\.cloud\\.google\\.com|jitpack\\.io|gradle\\.org|jetbrains\\.com"
+    },
+    {
+      "id": "creative",
+      "name": "Création",
+      "color": "#c6a0f6",
+      "app": "blender|aseprite|gimp|org\\.gimp\\..*|inkscape|krita|obs|com\\.obsproject\\.studio|kdenlive|figma.*",
+      "title": "figma|canva",
+      "domains": "figma\\.com|canva\\.com|blockbench|pixlr|photopea\\.com"
+    },
+    {
+      "id": "work",
+      "name": "Productivité",
+      "color": "#eed49f",
+      "app": "obsidian|libreoffice.*|soffice|org\\.gnome\\.nautilus|nautilus|org\\.gnome\\..*calendar|evolution|thunderbird",
+      "title": "notion|google docs|google sheets|docs\\.google|drive|calendar|agenda|trello|linear|jira|confluence|posthog|tebex",
+      "domains": "notion\\.so|docs\\.google\\.com|drive\\.google\\.com|calendar\\.google\\.com|trello\\.com|linear\\.app|atlassian\\.net|posthog\\.com|tebex\\.io|metabase|visage\\.jobs"
+    },
+    {
+      "id": "web",
+      "name": "Navigation",
+      "color": "#8bd5ca",
+      "app": "zen|zen-browser|firefox|chromium|google-chrome|brave-browser|vivaldi.*",
+      "title": ""
+    }
+  ],
+  "other": {
+    "id": "other",
+    "name": "Autre",
+    "color": "#a5adcb"
+  },
+  "names": {
+    "zen": "Zen Browser",
+    "discord": "Discord",
+    "org.gnome.ptyxis": "Terminal",
+    "spotify": "Spotify",
+    "org.gnome.nautilus": "Fichiers",
+    "jetbrains-idea-ce": "IntelliJ IDEA",
+    "jetbrains-idea": "IntelliJ IDEA",
+    "jetbrains-webstorm": "WebStorm",
+    "jetbrains-phpstorm": "PhpStorm",
+    "jetbrains-rider": "Rider",
+    "jetbrains-datagrip": "DataGrip",
+    "jetbrains-studio": "Android Studio",
+    "jetbrains-toolbox": "Toolbox",
+    "dev.zed.zed": "Zed",
+    "obsidian": "Obsidian",
+    "blender": "Blender",
+    "aseprite": "Aseprite",
+    "com.obsproject.studio": "OBS",
+    "prismlauncher": "Prism Launcher",
+    "lunarclient": "Lunar Client",
+    "orca": "Orca"
+  },
+  "icons": {
+    "zen": "~/.local/share/icons/hicolor/128x128/apps/appimagekit_bf0b4fc2b05440b5996a46de8b3a69bc_zen.png",
+    "orca": "~/.local/share/icons/hicolor/512x512/apps/appimagekit_bf8d15074109bdd96ffc651b65f470e8_orca-ide.png"
+  },
+  "media_max_idle_minutes": 150
+}

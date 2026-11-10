@@ -1,0 +1,146 @@
+{
+    "layer": "top",
+    "position": "top",
+    "height": 34,
+    "margin-top": 6,
+    "margin-left": 8,
+    "margin-right": 8,
+    "spacing": 8,
+
+    "modules-left": ["group/apps", "custom/media"],
+    "modules-center": ["group/center"],
+    "modules-right": ["group/claude", "custom/screentime", "group/vitals", "idle_inhibitor", "tray", "group/settings"],
+
+    // Horloge + bouton « Ne pas déranger » dans la même pilule
+    "group/center": {
+        "orientation": "horizontal",
+        "modules": ["custom/date", "custom/dnd"]
+    },
+    // Claude : lanceur + compteur de consommation
+    "group/claude": {
+        "orientation": "horizontal",
+        "modules": ["custom/claude", "custom/claude-usage"]
+    },
+    // Bureaux + fenêtre active (le lanceur Claude a sa propre pilule)
+    "group/apps": {
+        "orientation": "horizontal",
+        "modules": ["custom/overview", "hyprland/workspaces", "hyprland/window"]
+    },
+    // Bloc 2 : surveillance (équivalent de Vitals), lecture seule
+    "group/vitals": {
+        "orientation": "horizontal",
+        "modules": ["cpu", "temperature", "memory"]
+    },
+    // Réglages cliquables (Caffeine a sa propre pilule)
+    "group/settings": {
+        "orientation": "horizontal",
+        "modules": ["pulseaudio", "pulseaudio#mic", "custom/power"]
+    },
+
+    "custom/claude": {
+        "format": "󰚩",
+        "tooltip-format": "Lancer Claude Code",
+        "on-click": "~/.local/bin/claude-term"
+    },
+    // Musique en cours (cachée quand rien ne joue) ; clic = lecteur complet
+    // Twitch (via le navigateur) et Spotify sont reconnus à l'URL : ~/.local/bin/waybar-media
+    "custom/media": {
+        "exec": "~/.local/bin/waybar-media",
+        "return-type": "json",
+        "escape": false,
+        "on-click": "qs -c controls ipc call controls media $(~/.local/bin/waybar-pill-left)"
+    },
+    "custom/overview": {
+        "format": "󰕰",
+        "tooltip-format": "Vue d'ensemble des bureaux (Super+Tab)",
+        "on-click": "qs -c overview ipc call overview toggle"
+    },
+    "hyprland/workspaces": {
+        // Chaque écran n'affiche que ses bureaux (Samsung 1-5, AOC 6-10), numérotés 1 à 5
+        "format": "{icon}",
+        "format-icons": { "1": "1", "2": "2", "3": "3", "4": "4", "5": "5",
+                          "6": "1", "7": "2", "8": "3", "9": "4", "10": "5" },
+        "all-outputs": false,
+        "persistent-workspaces": { "DP-1": [1, 2, 3, 4, 5], "DP-2": [6, 7, 8, 9, 10] },
+        "on-click": "activate",
+        "sort-by-number": true
+    },
+    "hyprland/window": {
+        "format": "{}",
+        "max-length": 45,
+        "separate-outputs": true
+    },
+
+    "custom/date": {
+        "exec": "~/.local/bin/waybar-date",
+        "tooltip": false,
+        "on-click": "qs -c controls ipc call controls toggle dashboard"
+    },
+    // Ne pas déranger (pause de Dunst) ; clic droit = réafficher la dernière notification
+    "custom/dnd": {
+        "exec": "~/.local/bin/waybar-dnd",
+        "return-type": "json",
+        "interval": 5,
+        "signal": 10,
+        "on-click": "~/.local/bin/waybar-dnd toggle",
+        "on-click-right": "dunstctl history-pop"
+    },
+
+    // Temps d'écran du jour (ActivityWatch/awatcher) ; clic = onglet détaillé du dashboard
+    "custom/screentime": {
+        "exec": "~/.local/bin/screentime-fetch --waybar",
+        "return-type": "json",
+        "interval": 60,
+        "on-click": "qs -c controls ipc call controls dashboard screen"
+    },
+    "custom/claude-usage": {
+        "exec": "~/.local/bin/claude-usage-waybar",
+        "return-type": "json",
+        "interval": 60,
+        "on-click": "qs -c controls ipc call controls dashboard perf"
+    },
+    "cpu": { "format": "󰻠 {usage}%", "interval": 2, "tooltip-format": "Processeur", "on-click": "qs -c controls ipc call controls dashboard perf" },
+    "temperature": {
+        "hwmon-path-abs": "/sys/devices/pci0000:00/0000:00:18.3/hwmon",
+        "input-filename": "temp1_input",
+        "critical-threshold": 85,
+        "format": "󰔏 {temperatureC}°C",
+        "tooltip-format": "Température du processeur",
+        "on-click": "qs -c controls ipc call controls dashboard perf"
+    },
+    "memory": { "format": "󰍛 {used:0.1f} Go", "interval": 5, "tooltip-format": "Mémoire : {used:0.1f} / {total:0.1f} Go", "on-click": "qs -c controls ipc call controls dashboard perf" },
+
+    "idle_inhibitor": {
+        "format": "{icon}",
+        "format-icons": { "activated": "󰅶", "deactivated": "󰛊" },
+        "tooltip-format-activated": "Caffeine activé : l'écran ne se met pas en veille",
+        "tooltip-format-deactivated": "Caffeine désactivé : veille après 5 min"
+    },
+    "pulseaudio": {
+        "format": "{icon} {volume}%",
+        "format-muted": "󰝟 muet",
+        "format-icons": { "headphone": "󰋋", "headset": "󰋎", "default": ["󰕿", "󰖀", "󰕾"] },
+        "on-click": "qs -c controls ipc call controls toggle audio",
+        "on-click-right": "qs -c controls ipc call controls toggle devices",
+        "on-click-middle": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+        "scroll-step": 5,
+        "tooltip-format": "{desc}"
+    },
+    "pulseaudio#mic": {
+        "format": "{format_source}",
+        "format-source": "󰍬 {volume}%",
+        "format-source-muted": "󰍭 muet",
+        "on-click": "qs -c controls ipc call controls toggle audio",
+        "on-click-right": "qs -c controls ipc call controls toggle devices",
+        "on-click-middle": "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle",
+        "on-scroll-up": "wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 5%+",
+        "on-scroll-down": "wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 5%-",
+        "tooltip-format": "{source_desc}"
+    },
+    "tray": { "icon-size": 16, "spacing": 8 },
+    "custom/power": {
+        "format": "󰐥",
+        "tooltip-format": "Verrouiller, se déconnecter, redémarrer, éteindre",
+        "on-click": "qs -c controls ipc call controls toggle power"
+    }
+}

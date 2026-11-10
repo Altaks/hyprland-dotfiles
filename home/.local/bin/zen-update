@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Met à jour l'AppImage de Zen Browser en place (même chemin → raccourcis et associations conservés).
+set -euo pipefail
+A="$(ls ~/Applications/zen*.AppImage | head -1)"
+cur="$(~/.local/bin/zen-version || true)"
+latest="$(curl -fsSL https://api.github.com/repos/zen-browser/desktop/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')"
+echo "Installée : ${cur:-?}  |  Dernière : $latest"
+[ "$cur" = "$latest" ] && { echo "Déjà à jour."; exit 0; }
+pgrep -f "$(basename "$A")" >/dev/null && { echo "Fermez Zen avant la mise à jour."; exit 1; }
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+curl -fL --progress-bar -o "$tmp/zen.AppImage" "https://github.com/zen-browser/desktop/releases/download/$latest/zen-x86_64.AppImage"
+chmod +x "$tmp/zen.AppImage"
+cp -f "$A" "$A.old"
+mv -f "$tmp/zen.AppImage" "$A"
+echo "$latest $(stat -c %Y "$A")" > ~/.cache/zen-version
+echo "Zen mis à jour vers $latest (ancienne version : $A.old)"

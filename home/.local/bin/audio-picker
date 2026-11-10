@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Pick the default audio output (sink) or input (source) with tofi."""
+import re, subprocess, sys
+
+kind = sys.argv[1] if len(sys.argv) > 1 else "sink"
+section = "Sinks:" if kind == "sink" else "Sources:"
+status = subprocess.run(["wpctl", "status"], capture_output=True, text=True).stdout
+
+devices, inside = [], False
+for line in status.split("Video")[0].splitlines():
+    if section in line:
+        inside = True
+        continue
+    if inside:
+        m = re.match(r"[\s│├└─]*(\*)?\s*(\d+)\.\s+(.+?)\s*(\[vol:.*)?$", line)
+        if not m:
+            if line.strip(" │├└─"):
+                break
+            continue
+        devices.append((m.group(2), m.group(3), bool(m.group(1))))
+
+menu = "\n".join(("● " if cur else "  ") + name for _, name, cur in devices)
+prompt = "Sortie : " if kind == "sink" else "Micro : "
+choice = subprocess.run(["tofi", "-c", f"{__import__('os').path.expanduser('~')}/.cache/wal/tofi",
+                         "--prompt-text", prompt, "--drun-launch=false", "--height", "260"],
+                        input=menu, capture_output=True, text=True).stdout.strip()
+for dev_id, name, _ in devices:
+    if choice.endswith(name):
+        subprocess.run(["wpctl", "set-default", dev_id])
+        subprocess.run(["notify-send", "-a", "Audio", prompt.strip(" :"), name])
+        break

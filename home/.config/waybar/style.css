@@ -1,0 +1,200 @@
+/* Couleurs générées par Pywal à partir du fond d'écran */
+@import "../../.cache/wal/colors-waybar.css";
+
+* {
+    font-family: "CaskaydiaCove Nerd Font", sans-serif;
+    font-size: 13px;
+    border: none;
+    min-height: 0;
+}
+
+window#waybar {
+    background: transparent;
+}
+
+/* Chaque bloc est une « pilule » séparée :
+   applis · horloge · surveillance (Vitals) · réglages */
+#claude,
+#apps,
+#custom-media,
+#center,
+#vitals,
+#idle_inhibitor,
+#custom-screentime,
+#tray,
+#settings {
+    background: alpha(@background, 0.85);
+    border: 2px solid alpha(@color4, 0.6);
+    border-radius: 12px;
+    padding: 0 6px;
+}
+
+#custom-claude,
+#workspaces button,
+#window,
+#custom-date,
+#custom-claude-usage,
+#cpu,
+#temperature,
+#memory,
+#pulseaudio,
+#tray {
+    color: @foreground;
+    padding: 0 8px;
+}
+
+/* Orange Claude */
+#custom-claude {
+    color: #D97757;
+    font-size: 16px;
+    /* Le glyphe est décalé dans la police : on recentre à la main */
+    padding: 0 8px 2px 4px;
+}
+
+#idle_inhibitor {
+    color: @foreground;
+    padding: 0 14px;
+}
+
+#custom-power {
+    color: @foreground;
+    padding: 0 8px;
+}
+
+#idle_inhibitor.activated {
+    color: @color4;
+}
+
+#custom-power {
+    color: @color1;
+}
+
+/* Éléments cliquables : surbrillance au survol */
+#idle_inhibitor:hover,
+#custom-overview:hover,
+#pulseaudio:hover,
+#cpu:hover,
+#temperature:hover,
+#memory:hover,
+#custom-claude-usage:hover,
+#custom-screentime:hover,
+#custom-power:hover,
+#custom-date:hover,
+#custom-dnd:hover,
+#custom-claude:hover {
+    background: alpha(@color4, 0.2);
+    border-radius: 8px;
+}
+
+#workspaces button {
+    border-radius: 8px;
+    margin: 4px 1px;
+    padding: 0 6px;
+    background: transparent;
+}
+
+#workspaces button.active {
+    background: @color4;
+    color: @background;
+}
+
+/* Bureau vide : atténué */
+#workspaces button.empty {
+    color: alpha(@foreground, 0.35);
+}
+
+/* Bureau affiché sur l'autre écran */
+#workspaces button.visible:not(.active) {
+    background: alpha(@color4, 0.25);
+}
+
+#workspaces button:hover {
+    background: alpha(@color4, 0.3);
+    box-shadow: none;
+}
+
+#custom-overview {
+    color: @color4;
+    font-size: 15px;
+    padding: 0 8px;
+}
+
+/* Musique en cours */
+#custom-media {
+    color: @foreground;
+    padding: 0 14px;
+}
+
+#custom-media.paused {
+    color: alpha(@foreground, 0.6);
+}
+
+#custom-media:hover {
+    background: alpha(@color4, 0.2);
+}
+
+#window {
+    color: alpha(@foreground, 0.7);
+}
+
+#custom-date {
+    font-weight: bold;
+    padding: 0 10px 0 14px;
+}
+
+/* Ne pas déranger */
+#custom-dnd {
+    color: alpha(@foreground, 0.75);
+    font-size: 15px;
+    padding: 0 10px 0 8px;
+}
+
+#custom-dnd.on {
+    color: @color1;
+}
+
+/* Le bloc surveillance est en texte atténué ; un clic ouvre le menu détaillé */
+#vitals #cpu,
+#vitals #temperature,
+#vitals #memory {
+    color: alpha(@foreground, 0.75);
+}
+
+#custom-claude-usage.warning,
+#temperature.critical {
+    color: @color3;
+}
+
+#custom-claude-usage.critical,
+#pulseaudio.muted {
+    color: @color1;
+}
+
+#custom-claude-usage.off {
+    color: alpha(@foreground, 0.5);
+}
+
+tooltip {
+    background: @background;
+    border: 2px solid @color4;
+    border-radius: 10px;
+}
+
+tooltip label {
+    color: @foreground;
+}
+
+/* Temps d'écran : sa propre pilule */
+#custom-screentime {
+    color: @foreground;
+    padding: 0 12px;
+}
+
+#custom-screentime.off {
+    color: alpha(@foreground, 0.5);
+}
+
+/* Icônes d'arrière-plan (Discord, awatcher…) : pilule séparée des réglages */
+#tray {
+    padding: 0 12px;
+}

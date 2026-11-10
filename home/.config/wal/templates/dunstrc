@@ -1,0 +1,64 @@
+[global]
+    monitor = 0
+    follow = mouse
+    origin = top-right
+    offset = (12, 52)
+    width = (300, 400)
+    height = (0, 220)
+    notification_limit = 5
+    gap_size = 8
+    padding = 14
+    horizontal_padding = 16
+    text_icon_padding = 14
+    frame_width = 3
+    corner_radius = 14
+    separator_height = 0
+    font = CaskaydiaCove Nerd Font 10
+    markup = full
+    format = "<span size='small' foreground='{color8}'>%a</span>\n<b><span size='large'>%s</span></b>\n%b"
+    alignment = left
+    vertical_alignment = center
+    word_wrap = yes
+    ellipsize = end
+    icon_position = left
+    min_icon_size = 40
+    max_icon_size = 56
+    icon_corner_radius = 10
+    icon_theme = Papirus-Dark
+    enable_recursive_icon_lookup = true
+    progress_bar = true
+    progress_bar_height = 8
+    progress_bar_frame_width = 0
+    progress_bar_corner_radius = 4
+    highlight = "{color4}"
+    show_age_threshold = 60
+    stack_duplicates = true
+    hide_duplicate_count = false
+    mouse_left_click = do_action, close_current
+    mouse_middle_click = close_all
+    mouse_right_click = close_current
+
+[urgency_low]
+    background = "{background}f2"
+    foreground = "{foreground}"
+    frame_color = "{color8}"
+    timeout = 4
+
+[urgency_normal]
+    background = "{background}f2"
+    foreground = "{foreground}"
+    frame_color = "{color4}"
+    timeout = 6
+
+[urgency_critical]
+    background = "{background}f2"
+    foreground = "{foreground}"
+    # Rouge fixe (Catppuccin Macchiato), indépendant du fond d'écran : les urgentes doivent toujours ressortir
+    frame_color = "#ed8796"
+    highlight = "#ed8796"
+    timeout = 0
+
+# Son à l'affichage (pop pour normal, alerte pour critique ; low muet ; Discord a déjà le sien)
+[notif_sound]
+    summary = "*"
+    script = @HOME@/.local/bin/notif-sound

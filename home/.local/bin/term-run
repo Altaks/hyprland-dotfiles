@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Ouvre une nouvelle fenêtre Ptyxis qui exécute la commande donnée (chaîne passée à bash -lc).
+# Utilisé par le tableau de bord Quickshell : si qs a été (re)lancé depuis un contexte sans session
+# D-Bus (setsid depuis un script, une autre session…), Ptyxis — appli GTK/D-Bus — échoue sans rien
+# afficher. On rétablit donc XDG_RUNTIME_DIR et le bus de session s'ils manquent.
+: "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+: "${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}"
+export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+exec setsid -f ptyxis --new-window -x "bash -lc $(printf '%q' "$*")"

@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+"""Itinéraires Google Maps pour le tableau de bord Quickshell (onglet Nantes, barre de recherche).
+
+  route-fetch "départ" "arrivée" [transit|drive|bicycle|walk]
+Départ vide = adresse « home » de ~/.config/quickshell/naolib.json.
+API Google Routes (computeRoutes) ; clé dans ~/.config/quickshell/google-maps.key (secrète, hors dépôt),
+à créer sur console.cloud.google.com (API « Routes API » activée).
+Output: one JSON document on stdout
+  {"routes": [{"duration", "distance", "dep", "arr", "summary", "steps": [...], "path": [[lat, lon], …]}],
+   "mapsUrl", "mode"} ou {"error", "mapsUrl"} ; « mapsUrl » ouvre le même trajet dans Google Maps.
+"""
+import json, sys, urllib.parse, urllib.request
+from datetime import datetime
+from pathlib import Path
+
+KEY = Path.home() / ".config/quickshell/google-maps.key"
+CONFIG = Path.home() / ".config/quickshell/naolib.json"
+API = "https://routes.googleapis.com/directions/v2:computeRoutes"
+MODES = {"transit": ("TRANSIT", "transit"), "drive": ("DRIVE", "driving"),
+         "bicycle": ("BICYCLE", "bicycling"), "walk": ("WALK", "walking")}
+FIELDS = ",".join([
+    "routes.duration", "routes.distanceMeters", "routes.description", "routes.polyline.encodedPolyline",
+    "routes.localizedValues", "routes.legs.localizedValues", "routes.legs.steps.travelMode",
+    "routes.legs.steps.staticDuration", "routes.legs.steps.distanceMeters", "routes.legs.steps.transitDetails",
+    "routes.legs.steps.navigationInstruction.instructions", "routes.warnings"])
+
+
+def decode(poly):
+    """Polyline encodée Google → [[lat, lon], …]."""
+    pts, i, lat, lon = [], 0, 0, 0
+    while i < len(poly):
+        vals = []
+        for _ in range(2):
+            shift = res = 0
+            while True:
+                b = ord(poly[i]) - 63
+                i += 1
+                res |= (b & 0x1F) << shift
+                shift += 5
+                if b < 0x20:
+                    break
+            vals.append(~(res >> 1) if res & 1 else res >> 1)
+        lat += vals[0]
+        lon += vals[1]
+        pts.append([lat / 1e5, lon / 1e5])
+    return pts
+
+
+def secs(d):
+    return int(float(str(d).rstrip("s") or 0))
+
+
+def main():
+    origin, dest = (sys.argv[1:3] + ["", ""])[:2]
+    mode = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] in MODES else "transit"
+    try:
+        cfg = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    origin = origin.strip() or cfg.get("home", "")
+    maps_url = "https://www.google.com/maps/dir/?" + urllib.parse.urlencode(
+        {"api": 1, "origin": origin, "destination": dest, "travelmode": MODES[mode][1]})
+    if not dest.strip():
+        print(json.dumps({"error": "Indique une destination", "mapsUrl": maps_url}))
+        return
+    try:
+        key = KEY.read_text().strip()
+    except OSError:
+        print(json.dumps({"error": "nokey", "mapsUrl": maps_url, "mode": mode}))
+        return
+
+    body = {"origin": {"address": origin}, "destination": {"address": dest}, "travelMode": MODES[mode][0],
+            "computeAlternativeRoutes": True, "languageCode": "fr", "units": "METRIC", "regionCode": "FR"}
+    if mode == "drive":
+        body["routingPreference"] = "TRAFFIC_AWARE"
+    req = urllib.request.Request(API, data=json.dumps(body).encode(), method="POST", headers={
+        "Content-Type": "application/json", "X-Goog-Api-Key": key, "X-Goog-FieldMask": FIELDS})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            msg = json.load(e)["error"]["message"]
+        except Exception:
+            msg = f"HTTP {e.code}"
+        print(json.dumps({"error": msg[:300], "mapsUrl": maps_url, "mode": mode}))
+        return
+    except Exception as e:
+        print(json.dumps({"error": str(e)[:300], "mapsUrl": maps_url, "mode": mode}))
+        return
+
+    routes = []
+    for r in data.get("routes", []):
+        steps, dep, arr = [], "", ""
+        for leg in r.get("legs", []):
+            lv = leg.get("localizedValues", {})
+            for s in leg.get("steps", []):
+                td = s.get("transitDetails")
+                if td:
+                    line = td.get("transitLine", {})
+                    sd = td.get("stopDetails", {})
+                    loc = td.get("localizedValues", {})
+                    d = loc.get("departureTime", {}).get("time", {}).get("text", "")
+                    a = loc.get("arrivalTime", {}).get("time", {}).get("text", "")
+                    dep, arr = dep or d, a or arr
+                    steps.append({"kind": "transit", "line": line.get("nameShort") or line.get("name", ""),
+                                  "color": line.get("color", "#888888"), "text": line.get("textColor", "#ffffff"),
+                                  "vehicle": line.get("vehicle", {}).get("type", ""), "headsign": td.get("headsign", ""),
+                                  "from": sd.get("departureStop", {}).get("name", ""),
+                                  "to": sd.get("arrivalStop", {}).get("name", ""),
+                                  "dep": d, "arr": a, "stops": td.get("stopCount", 0)})
+                else:
+                    m, dur = s.get("travelMode", ""), secs(s.get("staticDuration", 0))
+                    if steps and steps[-1]["kind"] == m.lower():  # on fusionne les étapes à pied / en voiture
+                        steps[-1]["duration"] += dur
+                        steps[-1]["distance"] += s.get("distanceMeters", 0)
+                    else:
+                        steps.append({"kind": m.lower(), "duration": dur, "distance": s.get("distanceMeters", 0)})
+        if not dep:  # hors transports en commun : départ maintenant
+            now = datetime.now()
+            dep = now.strftime("%H:%M")
+            arr = datetime.fromtimestamp(now.timestamp() + secs(r.get("duration", 0))).strftime("%H:%M")
+        routes.append({"duration": secs(r.get("duration", 0)), "distance": r.get("distanceMeters", 0),
+                       "summary": r.get("description", ""), "dep": dep, "arr": arr, "steps": steps,
+                       "warnings": r.get("warnings", []),
+                       "path": decode(r.get("polyline", {}).get("encodedPolyline", ""))})
+    out = {"routes": routes, "mapsUrl": maps_url, "mode": mode, "origin": origin, "destination": dest}
+    if not routes:
+        out["error"] = "Aucun itinéraire trouvé"
+    print(json.dumps(out, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

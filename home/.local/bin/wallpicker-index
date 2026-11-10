@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Indexes the wallpaper library for the Quickshell picker.
+
+Scans ~/Pictures/backgrounds recursively (images and videos), makes cached
+thumbnails, and writes ~/.cache/wallpicker/index.json.
+"""
+import hashlib, json, os, subprocess
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+LIBRARY = Path(os.environ.get("WALLPAPER_LIBRARY", Path.home() / "Pictures/backgrounds"))
+CACHE = Path.home() / ".cache/wallpicker"
+THUMBS = CACHE / "thumbs"
+IMAGES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+VIDEOS = {".mp4", ".webm", ".mkv", ".mov"}
+
+def thumb_for(path: Path) -> Path:
+    st = path.stat()
+    key = hashlib.sha1(f"{path}:{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()
+    thumb = THUMBS / f"{key}.jpg"
+    if not thumb.exists():
+        tmp = thumb.with_suffix(".tmp.jpg")
+        if path.suffix.lower() in VIDEOS:
+            subprocess.run(["ffmpegthumbnailer", "-i", str(path), "-o", str(tmp), "-s", "640", "-t", "20%", "-q", "8"],
+                           check=True, capture_output=True)
+            subprocess.run(["magick", str(tmp), "-thumbnail", "640x360^", "-gravity", "center", "-extent", "640x360", str(tmp)],
+                           check=True, capture_output=True)
+        else:
+            subprocess.run(["magick", f"{path}[0]", "-auto-orient", "-thumbnail", "640x360^",
+                            "-gravity", "center", "-extent", "640x360", "-quality", "85", str(tmp)],
+                           check=True, capture_output=True)
+        tmp.rename(thumb)
+    return thumb
+
+def entry(path: Path):
+    try:
+        return {"path": str(path), "name": path.stem.replace("_", " ").replace("-", " "),
+                "thumb": str(thumb_for(path)), "video": path.suffix.lower() in VIDEOS}
+    except Exception:
+        return None
+
+THUMBS.mkdir(parents=True, exist_ok=True)
+files = sorted(p for p in LIBRARY.rglob("*") if p.is_file() and p.suffix.lower() in IMAGES | VIDEOS)
+with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
+    index = [e for e in pool.map(entry, files) if e]
+tmp = CACHE / "index.json.tmp"
+tmp.write_text(json.dumps(index))
+os.replace(tmp, CACHE / "index.json")
+print(len(index))

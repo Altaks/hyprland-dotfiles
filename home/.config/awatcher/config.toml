@@ -1,0 +1,14 @@
+[server]
+port = 5600
+host = "127.0.0.1"
+
+[awatcher]
+idle-timeout-seconds = 180
+poll-time-idle-seconds = 5
+poll-time-window-seconds = 1
+
+# Le titre de Ptyxis change chaque seconde (spinner de Claude Code) : il
+# découpe les événements et gonfle la base sans rien apprendre. On le fige.
+[[awatcher.filters]]
+match-app-id = "org.gnome.Ptyxis"
+replace-title = "Terminal"

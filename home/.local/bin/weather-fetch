@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Weather for the Quickshell dashboard, from Open-Meteo (free, no API key).
+
+Location: ~/.config/quickshell/weather-location.json  {"name": "...", "lat": .., "lon": ..}
+Set it with:  weather-fetch --set "Ville"   (geocoded by Open-Meteo)
+Output: one JSON document on stdout. Cached 15 min in ~/.cache/dashboard-weather.json.
+"""
+import json, sys, time, urllib.parse, urllib.request
+from datetime import datetime
+from pathlib import Path
+
+LOC = Path.home() / ".config/quickshell/weather-location.json"
+CACHE = Path.home() / ".cache/dashboard-weather.json"
+TTL = 900
+
+# Codes météo WMO → (description, icône Nerd Font jour, icône nuit)
+WMO = {
+    0: ("Ciel dégagé", "󰖙", "󰖔"), 1: ("Plutôt dégagé", "󰖙", "󰖔"), 2: ("Partiellement nuageux", "󰖕", "󰼱"),
+    3: ("Couvert", "󰖐", "󰖐"), 45: ("Brouillard", "󰖑", "󰖑"), 48: ("Brouillard givrant", "󰖑", "󰖑"),
+    51: ("Bruine légère", "󰖗", "󰖗"), 53: ("Bruine", "󰖗", "󰖗"), 55: ("Bruine dense", "󰖗", "󰖗"),
+    56: ("Bruine verglaçante", "󰙿", "󰙿"), 57: ("Bruine verglaçante", "󰙿", "󰙿"),
+    61: ("Pluie faible", "󰖗", "󰖗"), 63: ("Pluie", "󰖗", "󰖗"), 65: ("Forte pluie", "󰖖", "󰖖"),
+    66: ("Pluie verglaçante", "󰙿", "󰙿"), 67: ("Pluie verglaçante", "󰙿", "󰙿"),
+    71: ("Neige faible", "󰖘", "󰖘"), 73: ("Neige", "󰖘", "󰖘"), 75: ("Forte neige", "󰼶", "󰼶"), 77: ("Grains de neige", "󰖘", "󰖘"),
+    80: ("Averses", "󰖗", "󰖗"), 81: ("Averses", "󰖖", "󰖖"), 82: ("Fortes averses", "󰖖", "󰖖"),
+    85: ("Averses de neige", "󰼶", "󰼶"), 86: ("Averses de neige", "󰼶", "󰼶"),
+    95: ("Orage", "󰖓", "󰖓"), 96: ("Orage et grêle", "󰖒", "󰖒"), 99: ("Orage et grêle", "󰖒", "󰖒"),
+}
+DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+
+def get(url):
+    with urllib.request.urlopen(url, timeout=10) as r:
+        return json.load(r)
+
+def describe(code, day=True):
+    desc, d, n = WMO.get(code, ("—", "󰖐", "󰖐"))
+    return desc, d if day else n
+
+if len(sys.argv) > 2 and sys.argv[1] == "--set":
+    q = urllib.parse.quote(sys.argv[2])
+    res = get(f"https://geocoding-api.open-meteo.com/v1/search?name={q}&count=1&language=fr&format=json").get("results")
+    if not res:
+        sys.exit(f"Ville introuvable : {sys.argv[2]}")
+    r = res[0]
+    LOC.parent.mkdir(parents=True, exist_ok=True)
+    LOC.write_text(json.dumps({"name": r["name"], "lat": r["latitude"], "lon": r["longitude"]}))
+    CACHE.unlink(missing_ok=True)
+    print(f"{r['name']} ({r.get('admin1', '')}, {r.get('country', '')})")
+    sys.exit()
+
+try:
+    loc = json.loads(LOC.read_text())
+except Exception:
+    print(json.dumps({"error": "Ville non configurée"}))
+    sys.exit()
+
+try:
+    cache = json.loads(CACHE.read_text())
+    if time.time() - cache["fetched"] < TTL and cache.get("name") == loc["name"]:
+        print(json.dumps(cache))
+        sys.exit()
+except Exception:
+    cache = None
+
+params = urllib.parse.urlencode({
+    "latitude": loc["lat"], "longitude": loc["lon"], "timezone": "auto", "forecast_days": 7,
+    "current": "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day",
+    "hourly": "temperature_2m,weather_code,is_day,precipitation_probability",
+    "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max",
+})
+try:
+    d = get("https://api.open-meteo.com/v1/forecast?" + params)
+except Exception as e:
+    if cache:
+        print(json.dumps(cache | {"stale": True}))
+    else:
+        print(json.dumps({"error": f"Météo indisponible : {e}"}))
+    sys.exit()
+
+c = d["current"]
+desc, icon = describe(c["weather_code"], c["is_day"])
+now = datetime.fromisoformat(c["time"])
+h = d["hourly"]
+start = next(i for i, t in enumerate(h["time"]) if datetime.fromisoformat(t) >= now.replace(minute=0))
+hourly = [{
+    "time": h["time"][i][11:16],
+    "temp": round(h["temperature_2m"][i]),
+    "icon": describe(h["weather_code"][i], h["is_day"][i])[1],
+    "rain": h["precipitation_probability"][i],
+} for i in range(start, min(start + 24, len(h["time"])))]
+dl = d["daily"]
+daily = [{
+    "day": "Auj." if i == 0 else DAYS[datetime.fromisoformat(dl["time"][i]).weekday()],
+    "max": round(dl["temperature_2m_max"][i]),
+    "min": round(dl["temperature_2m_min"][i]),
+    "icon": describe(dl["weather_code"][i])[1],
+    "desc": describe(dl["weather_code"][i])[0],
+    "rain": dl["precipitation_probability_max"][i],
+} for i in range(len(dl["time"]))]
+
+out = {
+    "fetched": time.time(), "name": loc["name"],
+    "temp": round(c["temperature_2m"]), "feels": round(c["apparent_temperature"]),
+    "humidity": c["relative_humidity_2m"], "wind": round(c["wind_speed_10m"]),
+    "desc": desc, "icon": icon,
+    "max": daily[0]["max"], "min": daily[0]["min"],
+    "sunrise": dl["sunrise"][0][11:16], "sunset": dl["sunset"][0][11:16],
+    "hourly": hourly, "daily": daily,
+}
+CACHE.write_text(json.dumps(out))
+print(json.dumps(out))

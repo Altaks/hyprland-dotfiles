@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Zen Browser
+Comment=Ouvre les liens dans Zen, même depuis une AppImage (voir ~/.local/bin/zen-open)
+Exec=@HOME@/.local/bin/zen-open %u
+Icon=appimagekit_bf0b4fc2b05440b5996a46de8b3a69bc_zen
+Terminal=false
+NoDisplay=true
+StartupWMClass=zen
+MimeType=x-scheme-handler/http;x-scheme-handler/https;text/html;application/xhtml+xml;application/x-extension-html;application/x-extension-shtml;application/x-extension-xhtml;

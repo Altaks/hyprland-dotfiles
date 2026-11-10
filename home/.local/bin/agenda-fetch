@@ -1,0 +1,97 @@
+#!@HOME@/.local/share/dashboard-venv/bin/python
+"""Agenda pour le tableau de bord Quickshell : événements des 14 prochains jours, depuis des
+adresses iCal (Google Agenda : Paramètres de l'agenda → « Adresse secrète au format iCal »).
+
+Config: ~/.config/quickshell/agenda.json (secrète, hors dépôt)
+  {"calendars": [{"name": "Perso", "url": "https://calendar.google.com/.../basic.ics", "color": "#8aadf4"}]}
+  (« color » est facultatif : sinon une couleur Pywal est attribuée.)
+Output: one JSON document on stdout {"events": [...], "calendars": [...], "ts"} ou {"error": ...};
+chaque événement {"title", "start", "end", "allDay", "location", "link", "calendar", "color"}.
+Cached 10 min in ~/.cache/dashboard-agenda.json ; un agenda injoignable garde ses événements du cache.
+"""
+import json, re, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
+from pathlib import Path
+
+import icalendar
+import recurring_ical_events
+
+CONFIG = Path.home() / ".config/quickshell/agenda.json"
+CACHE = Path.home() / ".cache/dashboard-agenda.json"
+TTL = 600
+DAYS = 14
+LINK = re.compile(r"https://(?:meet\.google\.com|[\w.-]*zoom\.us|teams\.microsoft\.com|discord\.gg)/\S+")
+
+
+def get(url):
+    url = re.sub(r"^webcal://", "https://", url)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (dashboard agenda)"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read()
+
+
+def stamp(v):
+    """date (journée entière) → minuit local ; datetime (avec ou sans fuseau) → timestamp."""
+    if isinstance(v, datetime):
+        return int(v.timestamp())  # sans tzinfo = heure locale
+    return int(datetime(v.year, v.month, v.day).timestamp())
+
+
+def events_of(cal):
+    raw = get(cal["url"])
+    ical = icalendar.Calendar.from_ical(raw)
+    start = date.today()
+    out = []
+    for ev in recurring_ical_events.of(ical).between(start, start + timedelta(days=DAYS)):
+        if str(ev.get("STATUS", "")).upper() == "CANCELLED":
+            continue
+        s = ev.get("DTSTART").dt
+        e = ev.get("DTEND").dt if ev.get("DTEND") else (s + (ev.get("DURATION").dt if ev.get("DURATION") else timedelta(0)))
+        text = " ".join(str(ev.get(k, "")) for k in ("X-GOOGLE-CONFERENCE", "LOCATION", "DESCRIPTION", "URL"))
+        m = LINK.search(text)
+        out.append({
+            "title": str(ev.get("SUMMARY", "(Sans titre)")),
+            "start": stamp(s), "end": stamp(e), "allDay": not isinstance(s, datetime),
+            "location": str(ev.get("LOCATION", "")),
+            "link": m.group(0).rstrip(">)\"'") if m else "",
+            "calendar": cal["name"], "color": cal.get("color", ""),
+        })
+    return out
+
+
+def main():
+    force = "--force" in sys.argv
+    try:
+        cached = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        cached = None
+    if cached and not force and time.time() - cached.get("ts", 0) < TTL:
+        print(json.dumps(cached))
+        return
+    try:
+        cals = json.loads(CONFIG.read_text()).get("calendars", [])
+    except (OSError, ValueError):
+        cals = []
+    if not cals:
+        print(json.dumps({"error": "noconfig"}))
+        return
+
+    events, errors = [], []
+    with ThreadPoolExecutor(4) as pool:
+        for cal, fut in [(c, pool.submit(events_of, c)) for c in cals]:
+            try:
+                events += fut.result()
+            except Exception as e:
+                errors.append(f"{cal['name']} : {e}")
+                events += [ev for ev in (cached or {}).get("events", []) if ev["calendar"] == cal["name"]]
+    now = time.time()
+    events = sorted((e for e in events if e["end"] > now or e["allDay"] and e["end"] > now - 1), key=lambda e: (e["start"], not e["allDay"]))
+    out = {"events": events, "calendars": [{"name": c["name"], "color": c.get("color", "")} for c in cals],
+           "errors": errors, "ts": int(now)}
+    CACHE.write_text(json.dumps(out))
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Affiche la version de l'AppImage de Zen Browser SANS la lancer quand c'est possible :
+# lancer « zen.AppImage --version » depuis le tableau de bord pouvait bloquer > 30 s (AppImageLauncher,
+# instance déjà ouverte, tube de sortie gardé ouvert par un sous-processus).
+#  1. ~/.cache/zen-version (écrit par zen-update) si l'AppImage n'a pas changé depuis ;
+#  2. LastVersion du compatibility.ini du profil le plus récent, s'il est plus récent que l'AppImage ;
+#  3. sinon --version (sortie dans un fichier, délai 20 s), puis on mémorise le résultat.
+A="$(ls ~/Applications/zen*.AppImage 2>/dev/null | head -1)"
+[ -n "$A" ] || exit 1
+STAMP=~/.cache/zen-version
+mt=$(stat -c %Y "$A")
+if [ -f "$STAMP" ] && [ "$(cut -d' ' -f2 "$STAMP")" = "$mt" ]; then cut -d' ' -f1 "$STAMP"; exit 0; fi
+ini="$(ls -t ~/.zen/*/compatibility.ini 2>/dev/null | head -1)"
+if [ -n "$ini" ] && [ "$(stat -c %Y "$ini")" -gt "$mt" ]; then
+    v="$(grep -oP '^LastVersion=\K[^_]+' "$ini")"
+    [ -n "$v" ] && { echo "$v $mt" > "$STAMP"; echo "$v"; exit 0; }
+fi
+out="$(mktemp)"; trap 'rm -f "$out"' EXIT
+APPIMAGELAUNCHER_DISABLE=1 timeout 20 "$A" --version >"$out" 2>/dev/null </dev/null
+v="$(grep -oP 'Zen \K\S+' "$out")"
+[ -n "$v" ] || exit 1
+echo "$v $mt" > "$STAMP"; echo "$v"

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Appelé par dunst (règle [notif_sound]) à chaque notification affichée.
+# Variables fournies par dunst : DUNST_URGENCY (LOW|NORMAL|CRITICAL), DUNST_APP_NAME.
+case "${DUNST_APP_NAME,,}" in
+    discord|vesktop|spotify) exit 0 ;;   # ces applis jouent déjà leur propre son / trop fréquent
+esac
+dir=/usr/share/sounds/freedesktop/stereo
+case "$DUNST_URGENCY" in
+    CRITICAL) snd=$dir/dialog-warning.oga ;;
+    NORMAL)   snd=$dir/message-new-instant.oga ;;
+    *)        exit 0 ;;
+esac
+exec pw-play "$snd" >/dev/null 2>&1

@@ -1,0 +1,41 @@
+#!/bin/bash
+# Applies a wallpaper (image or video) on Hyprland and regenerates the Pywal colours.
+# Usage: hypr-wallpaper [file]   (no argument: restore the last one, and the slideshow if it was on)
+set -euo pipefail
+dir="$HOME/.cache/hypr-wallpaper"; mkdir -p "$dir"
+restore=false
+[ $# -eq 0 ] && restore=true
+img="${1:-$(cat "$dir/current" 2>/dev/null || echo "$HOME/.config/background")}"
+img="$(readlink -f "$img")"
+
+# A manual choice stops the slideshow; the slideshow itself sets HYPR_SLIDESHOW=1.
+if [ -z "${HYPR_SLIDESHOW:-}" ] && ! $restore; then hypr-slideshow stop; fi
+
+pgrep -x awww-daemon >/dev/null || { awww-daemon >/dev/null 2>&1 & sleep 0.5; }
+
+case "${img,,}" in
+    *.mp4|*.webm|*.mkv|*.mov)
+        # Still frame for the colours and as the image underneath the video.
+        ffmpegthumbnailer -i "$img" -o "$dir/frame.jpg" -s 0 -t 20% -q 9
+        awww img "$dir/frame.jpg" --transition-type grow --transition-fps 144 --transition-duration 1
+        pkill -x mpvpaper || true
+        # -p: pauses when the wallpaper is fully hidden (fullscreen window), saves GPU.
+        setsid mpvpaper -p -o "no-audio loop hwdec=auto panscan=1.0" '*' "$img" >/dev/null 2>&1 &
+        colours="$dir/frame.jpg" ;;
+    *)
+        pkill -x mpvpaper || true
+        awww img "$img" --transition-type grow --transition-fps 144 --transition-duration 1
+        colours="$img" ;;
+esac
+
+wal -i "$colours" -n -q -e -t -s
+printf '%s\n' "$img" > "$dir/current"
+
+hyprctl reload >/dev/null
+pkill -SIGUSR2 waybar || true
+pkill -x dunst || true; (setsid dunst >/dev/null 2>&1 &)
+# Vicinae: re-read ~/.cache/wal/vicinae-pywal.toml (symlinked as theme "pywal")
+vicinae theme set pywal >/dev/null 2>&1 || true
+setsid -f "$HOME/.local/bin/orbs-theme" >/dev/null 2>&1 </dev/null   # orbes de chargement Vicinae aux couleurs Pywal
+
+if $restore && [ -f "$dir/slideshow" ]; then hypr-slideshow start "$(sed -n 1p "$dir/slideshow")" "$(sed -n 2p "$dir/slideshow")"; fi

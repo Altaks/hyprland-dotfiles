@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Mode « Ne pas déranger » pour Waybar, basé sur la pause de Dunst.
+#   waybar-dnd          → état en JSON (module custom/dnd)
+#   waybar-dnd toggle   → active / désactive, puis rafraîchit Waybar (signal 10)
+# En pause, Dunst garde les notifications en attente et les affiche à la désactivation.
+
+case "$1" in
+    toggle)
+        dunstctl set-paused toggle
+        pkill -RTMIN+10 -x waybar
+        ;;
+    *)
+        if [ "$(dunstctl is-paused)" = "true" ]; then
+            n=$(dunstctl count waiting)
+            tip="Ne pas déranger activé"
+            [ "$n" -gt 0 ] && tip="$tip\n$n notification(s) en attente"
+            printf '{"text":"󰂛","class":"on","alt":"on","tooltip":"%s\\nClic : désactiver"}\n' "$tip"
+        else
+            printf '{"text":"󰂚","class":"off","alt":"off","tooltip":"Notifications activées\\nClic : ne pas déranger"}\n'
+        fi
+        ;;
+esac

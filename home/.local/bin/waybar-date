@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Waybar date, French with capitalised day and month: « Jeudi 22 Octobre  21:03 ».
+
+Prints one line per minute, right after the minute changes.
+"""
+import locale, sys, time
+from datetime import datetime
+
+locale.setlocale(locale.LC_TIME, "fr_FR.UTF-8")
+while True:
+    now = datetime.now()
+    day, month = now.strftime("%A").capitalize(), now.strftime("%B").capitalize()
+    print(f"{day} {now.day} {month}  {now:%H:%M}", flush=True)
+    time.sleep(60 - now.second - now.microsecond / 1e6 + 0.05)

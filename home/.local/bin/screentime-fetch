@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""Temps d'écran façon Apple, à partir d'ActivityWatch (awatcher, localhost:5600).
+
+Croise la fenêtre active avec les périodes « non inactif », range chaque
+application dans une catégorie (pour le navigateur : domaine de l'onglet si
+l'extension aw-watcher-web est installée, sinon titre). Un onglet qui joue du
+son au premier plan (vidéo, stream) compte comme actif même sans clavier/souris,
+dans la limite de media_max_idle_minutes après la dernière action. Catégories (~/.config/screentime/categories.json) et écrit :
+  - ~/.local/share/screentime/daily.json : un résumé par jour, gardé à vie
+    (les jours passés ne sont calculés qu'une fois) ;
+  - ~/.cache/screentime.json : aujourd'hui, 7 jours, cumul à vie (pour Quickshell).
+
+Usage : screentime-fetch            → recalcule et écrit le cache
+        screentime-fetch --waybar   → JSON Waybar (cache réutilisé s'il a < 50 s)
+        screentime-fetch --rebuild  → recalcule tous les jours depuis le début
+"""
+import fcntl, json, os, re, sys, time, urllib.parse, urllib.request
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+API = "http://127.0.0.1:5600/api/0"
+CONF = Path.home() / ".config/screentime/categories.json"
+DAILY = Path.home() / ".local/share/screentime/daily.json"
+CACHE = Path.home() / ".cache/screentime.json"
+LOCK = Path.home() / ".cache/screentime.lock"
+WEB_GAP = 70.0     # l'extension web n'envoie un battement que ~1 fois par minute
+GAP = 2.0          # un battement couvre au plus sa durée + 2 s (période de sondage 1 s)
+WEEKDAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+
+
+def get(path, **params):
+    q = ("?" + urllib.parse.urlencode(params)) if params else ""
+    with urllib.request.urlopen(API + path + q, timeout=10) as r:
+        return json.load(r)
+
+
+def load_conf():
+    c = json.loads(CONF.read_text())
+    cats = c["categories"]
+    for cat in cats:
+        cat["_app"] = re.compile(cat["app"], re.I) if cat.get("app") else None
+        cat["_title"] = re.compile(cat["title"], re.I) if cat.get("title") else None
+        cat["_dom"] = re.compile(cat["domains"], re.I) if cat.get("domains") else None
+    web = next((k for k in cats if k["id"] == "web"), None)
+    icons = {k.lower(): os.path.expanduser(v) for k, v in c.get("icons", {}).items()}
+    media = 60 * float(c.get("media_max_idle_minutes", 150))
+    return cats, c["other"], web, {k.lower(): v for k, v in c.get("names", {}).items()}, icons, media
+
+
+CATS, OTHER, WEB, NAMES, ICONS, MEDIA_MAX = load_conf()
+_memo = {}
+
+
+def is_browser(app):
+    return bool(WEB and WEB["_app"] and WEB["_app"].fullmatch((app or "").lower()))
+
+
+def categorize(app, title, host=""):
+    key = (app, title, host)
+    if key in _memo:
+        return _memo[key]
+    a = (app or "").lower()
+    res = None
+    browser = is_browser(app)
+    if browser and host:
+        res = next((k["id"] for k in CATS if k["_dom"] and k["_dom"].search(host)), None)
+    if not browser:
+        res = next((k["id"] for k in CATS if k["_app"] and k["_app"].fullmatch(a)), None)
+    if res is None and title:
+        res = next((k["id"] for k in CATS if k["_title"] and k["_title"].search(title)), None)
+    if res is None:
+        res = "web" if browser else OTHER["id"]
+    _memo[key] = res
+    return res
+
+
+def display_name(app):
+    a = (app or "?").lower()
+    if a in NAMES:
+        return NAMES[a]
+    a = re.sub(r"^(org|com|io|dev|app)\.[^.]+\.", "", app or "?")
+    return a[:1].upper() + a[1:]
+
+
+def parse_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def intervals(events, gap=GAP):
+    """Événements → [(début, fin, data)] en comblant les trous entre battements."""
+    evs = sorted(((parse_ts(e["timestamp"]), e["duration"], e["data"]) for e in events), key=lambda x: x[0])
+    out = []
+    for i, (t, d, data) in enumerate(evs):
+        end = t + d + gap
+        if i + 1 < len(evs):
+            end = min(end, max(evs[i + 1][0], t + d))
+        out.append((t, max(end, t + d), data))
+    return out
+
+
+def day_bounds(day):
+    start = datetime(day.year, day.month, day.day).astimezone()
+    return start.timestamp(), (start + timedelta(days=1)).timestamp()
+
+
+def buckets():
+    b = get("/buckets/")
+    win = [k for k, v in b.items() if v["type"] == "currentwindow"]
+    afk = [k for k, v in b.items() if v["type"] == "afkstatus"]
+    web = [k for k, v in b.items() if v["type"] == "web.tab.current"]
+    return win, afk, web
+
+
+def fetch(bucket, t0, t1):
+    iso = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat()
+    return get(f"/buckets/{urllib.parse.quote(bucket)}/events", start=iso(t0 - 60), end=iso(t1), limit=-1)
+
+
+def merge(spans, t0, t1):
+    """Union d'intervalles, bornée à [t0, t1]."""
+    out = []
+    for s, e in sorted(spans):
+        s, e = max(s, t0), min(e, t1)
+        if e <= s:
+            continue
+        if out and s <= out[-1][1] + 1:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def host_of(url):
+    try:
+        return (urllib.parse.urlsplit(url or "").hostname or "").removeprefix("www.")
+    except ValueError:
+        return ""
+
+
+def split_by_tabs(wins, tabs):
+    """Découpe les périodes « navigateur au premier plan » selon l'onglet actif
+    (aw-watcher-web) → [(début, fin, app, titre, domaine, son)]."""
+    out, j = [], 0
+    for s, e, data in wins:
+        app, title = data.get("app") or "?", data.get("title") or ""
+        if not tabs or not is_browser(app):
+            out.append((s, e, app, title, "", False))
+            continue
+        while j < len(tabs) and tabs[j][1] <= s:
+            j += 1
+        a, k = s, j
+        while k < len(tabs) and tabs[k][0] < e:
+            ts, te, td = tabs[k]
+            if ts > a:
+                out.append((a, ts, app, title, "", False))
+            b = min(e, te)
+            if b > max(a, ts):
+                out.append((max(a, ts), b, app, td.get("title") or title,
+                            host_of(td.get("url")), bool(td.get("audible"))))
+            a = max(a, b)
+            k += 1
+        if a < e:
+            out.append((a, e, app, title, "", False))
+    return out
+
+
+def summarize(day, win_b, afk_b, web_b=()):
+    t0, t1 = day_bounds(day)
+    active = []
+    for b in afk_b:
+        active += [(s, e) for s, e, d in intervals(fetch(b, t0, t1)) if d.get("status") == "not-afk"]
+    merged = merge(active, t0, t1)
+    pickups = len(merged)
+    wins = []
+    for b in win_b:
+        wins += intervals(fetch(b, t0, t1))
+    wins.sort(key=lambda x: x[0])
+    tabs = []
+    for b in web_b:
+        tabs += [x for x in intervals(fetch(b, t0, t1), WEB_GAP) if x[1] > x[0]]
+    tabs.sort(key=lambda x: x[0])
+    segs = split_by_tabs(wins, tabs)
+    # Son en cours au premier plan = actif, au plus MEDIA_MAX après la dernière action
+    media = []
+    for s, e, _app, _t, _h, audible in segs:
+        if not audible:
+            continue
+        last = max((b for a, b in merged if a <= s), default=None)
+        if last is not None and s - last < MEDIA_MAX:
+            media.append((s, min(e, last + MEDIA_MAX)))
+    with_media = merge([tuple(x) for x in merged] + media, t0, t1)
+
+    hours = [dict() for _ in range(24)]
+    cats, apps = {}, {}
+    for s, e, app, title, host, audible in segs:
+        s, e = max(s, t0), min(e, t1)
+        if e <= s:
+            continue
+        cat = categorize(app, title, host)
+        act = with_media if audible else merged
+        lo, hi = 0, len(act)
+        while lo < hi:   # premier intervalle actif qui finit après s
+            mid = (lo + hi) // 2
+            if act[mid][1] <= s:
+                lo = mid + 1
+            else:
+                hi = mid
+        k = lo
+        while k < len(act) and act[k][0] < e:
+            a, b = max(s, act[k][0]), min(e, act[k][1])
+            # Répartition par heure locale
+            while a < b:
+                h = datetime.fromtimestamp(a).hour
+                # Fin de l'heure locale (juste aussi les jours de changement d'heure)
+                nxt = datetime.fromtimestamp(a).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                hend = min(b, nxt.timestamp())
+                dur = hend - a
+                hours[h][cat] = hours[h].get(cat, 0) + dur
+                cats[cat] = cats.get(cat, 0) + dur
+                name = display_name(app)
+                ap = apps.setdefault(name, {"s": 0, "cat": cat, "c": {}, "id": app})
+                ap["s"] += dur
+                ap["c"][cat] = ap["c"].get(cat, 0) + dur
+                a = hend
+            k += 1
+    for ap in apps.values():
+        ap["cat"] = max(ap["c"], key=ap["c"].get)
+        ap["s"] = round(ap["s"])
+        del ap["c"]
+        if ap["id"].lower() in ICONS:
+            ap["icon"] = ICONS[ap["id"].lower()]
+    total = sum(cats.values())
+    first = merged[0][0] if merged else None
+    return {
+        "total": round(total),
+        "pickups": pickups,
+        "first": datetime.fromtimestamp(first).strftime("%H:%M") if first else None,
+        "cats": {k: round(v) for k, v in cats.items()},
+        "hours": [{k: round(v) for k, v in h.items()} for h in hours],
+        "apps": dict(sorted(apps.items(), key=lambda kv: -kv[1]["s"])[:40]),
+    }
+
+
+def first_day(win_b):
+    days = []
+    for b in win_b:
+        ev = get(f"/buckets/{urllib.parse.quote(b)}")
+        start = (ev.get("metadata") or {}).get("start") or ev.get("created")
+        if start:
+            days.append(datetime.fromtimestamp(parse_ts(start)).date())
+    return min(days) if days else date.today()
+
+
+def build(rebuild=False):
+    win_b, afk_b, web_b = buckets()
+    daily = {} if rebuild or not DAILY.exists() else json.loads(DAILY.read_text())
+    today = date.today()
+    d = first_day(win_b)
+    while d <= today:
+        key = d.isoformat()
+        # Hier est recalculé une fois de plus (battements arrivés après minuit)
+        if key not in daily or d >= today - timedelta(days=1) and not daily[key].get("final"):
+            daily[key] = summarize(d, win_b, afk_b, web_b)
+            daily[key]["final"] = d < today - timedelta(days=1)
+        d += timedelta(days=1)
+    DAILY.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DAILY.with_suffix(".tmp")
+    tmp.write_text(json.dumps(daily, ensure_ascii=False, separators=(",", ":")))
+    tmp.replace(DAILY)
+    return daily
+
+
+def report(daily):
+    today = date.today()
+    tk = today.isoformat()
+    t = daily.get(tk) or summarize(today, *buckets())
+    week = []
+    for i in range(6, -1, -1):
+        d = today - timedelta(days=i)
+        s = daily.get(d.isoformat(), {})
+        week.append({"date": d.isoformat(), "label": WEEKDAYS[d.weekday()], "total": s.get("total", 0),
+                     "cats": s.get("cats", {})})
+    past = [s["total"] for k, s in daily.items() if k != tk and s.get("total", 0) > 0]
+    prev7 = [daily.get((today - timedelta(days=i)).isoformat(), {}).get("total", 0) for i in range(1, 8)]
+    prev7 = [x for x in prev7 if x > 0]
+    # Cumul à vie
+    life_cats, life_apps = {}, {}
+    for s in daily.values():
+        for k, v in s.get("cats", {}).items():
+            life_cats[k] = life_cats.get(k, 0) + v
+        for n, a in s.get("apps", {}).items():
+            la = life_apps.setdefault(n, {"s": 0, "cat": a["cat"], "id": a.get("id", n), "icon": a.get("icon")})
+            la["s"] += a["s"]
+    active_days = [s for s in daily.values() if s.get("total", 0) > 0]
+    best = max(daily.items(), key=lambda kv: kv[1].get("total", 0)) if daily else None
+    cat_meta = [{"id": k["id"], "name": k["name"], "color": k["color"]} for k in CATS] + [OTHER]
+    return {
+        "updated": int(time.time()),
+        "categories": cat_meta,
+        "today": {**t, "date": tk, "avg7": round(sum(prev7) / len(prev7)) if prev7 else 0,
+                  "yesterday": daily.get((today - timedelta(days=1)).isoformat(), {}).get("total", 0)},
+        "week": week,
+        "lifetime": {
+            "total": sum(s.get("total", 0) for s in daily.values()),
+            "since": min(daily) if daily else tk,
+            "days": len(active_days),
+            "avg": round(sum(s["total"] for s in active_days) / len(active_days)) if active_days else 0,
+            "pickups": sum(s.get("pickups", 0) for s in daily.values()),
+            "best": {"date": best[0], "total": best[1].get("total", 0)} if best else None,
+            "cats": dict(sorted(life_cats.items(), key=lambda kv: -kv[1])),
+            "apps": dict(sorted(life_apps.items(), key=lambda kv: -kv[1]["s"])[:10]),
+        },
+    }
+
+
+def hm(sec):
+    h, m = divmod(int(sec) // 60, 60)
+    return f"{h} h {m:02d}" if h else f"{m} min"
+
+
+def main():
+    args = sys.argv[1:]
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOCK, "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        data = None
+        if "--waybar" in args and CACHE.exists() and time.time() - CACHE.stat().st_mtime < 50:
+            try:
+                data = json.loads(CACHE.read_text())
+            except ValueError:
+                pass
+        if data is None:
+            try:
+                data = report(build(rebuild="--rebuild" in args))
+            except OSError as e:
+                if "--waybar" in args:
+                    print(json.dumps({"text": "󰔛 —", "tooltip": f"ActivityWatch injoignable ({e})", "class": "off"}))
+                    return
+                print(json.dumps({"error": str(e)}))
+                return
+            tmp = CACHE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False))
+            tmp.replace(CACHE)
+    if "--waybar" in args:
+        t = data["today"]
+        names = {c["id"]: c["name"] for c in data["categories"]}
+        lines = [f"Temps d'écran aujourd'hui : {hm(t['total'])}"]
+        if t["avg7"]:
+            diff = t["total"] - t["avg7"]
+            lines.append(f"{'+' if diff >= 0 else '−'}{hm(abs(diff))} par rapport à la moyenne sur 7 jours")
+        for k, v in sorted(t["cats"].items(), key=lambda kv: -kv[1])[:4]:
+            lines.append(f"  {names.get(k, k)} : {hm(v)}")
+        lines.append(f"À vie : {hm(data['lifetime']['total'])}")
+        print(json.dumps({"text": f"󰔛 {hm(t['total'])}", "tooltip": "\n".join(lines), "class": "ok"}))
+    elif "--quiet" not in args:
+        print(json.dumps(data, ensure_ascii=False))
+
+
+main()

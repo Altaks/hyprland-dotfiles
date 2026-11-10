@@ -1,0 +1,221 @@
+#!@HOME@/.local/share/dashboard-venv/bin/python
+"""Données statiques Naolib pour le tableau de bord (appelé par naolib-fetch quand elles sont périmées).
+
+  naolib-build index  → ~/.cache/dashboard-naolib/index.json : arrêts, lignes, destinations (GTFS, chaque semaine)
+  naolib-build day    → day.json : courses du jour des lignes structurantes (tram, Busway, Chronobus) avec
+                        horaires et coordonnées, + horaires du jour aux arrêts suivis (chaque jour)
+  naolib-build map    → map.json : tracés des lignes, arrêts de tram, fond de carte OpenStreetMap
+                        (eau, parcs, routes, quartiers via Overpass) — chaque mois
+"""
+import csv, io, json, sys, time, urllib.parse, urllib.request, zipfile
+from datetime import datetime
+from pathlib import Path
+
+DIR = Path.home() / ".cache/dashboard-naolib"
+CONFIG = Path.home() / ".config/quickshell/naolib.json"
+GTFS = DIR / "gtfs.zip"
+GTFS_META = ("https://data.nantesmetropole.fr/api/explore/v2.1/catalog/datasets/"
+             "244400404_transports_commun_naolib_nantes_metropole_gtfs/records?limit=1")
+OVERPASS = "https://overpass-api.de/api/interpreter"
+BBOX = "47.14,-1.72,47.32,-1.40"
+
+
+def get(url, data=None, timeout=300):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": "hantrox-dashboard/1.0 (personal desktop widget)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def gtfs():
+    if not GTFS.exists() or time.time() - GTFS.stat().st_mtime > 7 * 86400:
+        DIR.mkdir(parents=True, exist_ok=True)
+        url = json.loads(get(GTFS_META))["results"][0]["fichier"]["url"]
+        tmp = GTFS.with_suffix(".tmp")
+        tmp.write_bytes(get(url))
+        tmp.replace(GTFS)
+    z = zipfile.ZipFile(GTFS)
+    return lambda name: csv.DictReader(io.TextIOWrapper(z.open(name), "utf-8-sig"))
+
+
+def structuring(r):
+    n = r["route_short_name"]
+    return r["route_type"] == "0" or n == "4" or (n.startswith("C") and n[1:].isdigit())
+
+
+def build_index():
+    rows = gtfs()
+    idx = {"stops": {r["stop_id"]: [r["stop_name"], r["parent_station"] or r["stop_id"]] for r in rows("stops.txt")},
+           "routes": {r["route_id"]: [r["route_short_name"], r["route_color"] or "888888", r["route_text_color"] or "ffffff",
+                                      int(r["route_type"] or 3)] for r in rows("routes.txt")},
+           "trips": {r["trip_id"]: [r["route_id"], r["trip_headsign"]] for r in rows("trips.txt")},
+           "ts": int(time.time())}
+    (DIR / "index.json").write_text(json.dumps(idx))
+
+
+def build_day():
+    rows = gtfs()
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    midnight, ymd = today.timestamp(), today.strftime("%Y%m%d")
+    wd = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"][today.weekday()]
+    services = {r["service_id"] for r in rows("calendar.txt") if r[wd] == "1" and r["start_date"] <= ymd <= r["end_date"]}
+    for r in rows("calendar_dates.txt"):
+        if r["date"] == ymd:
+            (services.add if r["exception_type"] == "1" else services.discard)(r["service_id"])
+    try:
+        wanted = set(json.loads(CONFIG.read_text()).get("stops", []))
+    except (OSError, ValueError):
+        wanted = set()
+    stops = {r["stop_id"]: r for r in rows("stops.txt")}
+    parents = {k for k, r in stops.items() if r["stop_name"] in wanted and r["location_type"] == "1"}
+    my_quays = {k: stops[r["parent_station"]]["stop_name"] for k, r in stops.items() if r["parent_station"] in parents}
+    routes = {r["route_id"]: r for r in rows("routes.txt")}
+    trips = {}
+    for r in rows("trips.txt"):
+        if r["service_id"] in services:
+            trips[r["trip_id"]] = {"route": r["route_id"], "headsign": r["trip_headsign"],
+                                   "map": structuring(routes[r["route_id"]]), "st": []}
+    stop_deps = []
+    for r in rows("stop_times.txt"):
+        t = trips.get(r["trip_id"])
+        if t is None:
+            continue
+        h, m, s = map(int, (r["departure_time"] or r["arrival_time"]).split(":"))
+        ts = int(midnight + h * 3600 + m * 60 + s)
+        seq = int(r["stop_sequence"])
+        if t["map"]:
+            st = stops[r["stop_id"]]
+            t["st"].append([seq, ts, round(float(st["stop_lat"]), 5), round(float(st["stop_lon"]), 5),
+                            stops.get(st["parent_station"], st)["stop_name"]])
+        if r["stop_id"] in my_quays:
+            stop_deps.append([my_quays[r["stop_id"]], r["trip_id"], t["route"], t["headsign"], seq, ts])
+    map_trips = {tid: {"route": t["route"], "headsign": t["headsign"], "st": sorted(t["st"])}
+                 for tid, t in trips.items() if t["map"] and t["st"]}
+    (DIR / "day.json").write_text(json.dumps({"date": ymd, "stops": sorted(wanted), "trips": map_trips,
+                                              "deps": sorted(stop_deps, key=lambda d: d[5])}))
+
+
+def rdp(pts, eps):
+    """Douglas-Peucker ; un anneau fermé est coupé en deux au point le plus éloigné."""
+    if len(pts) < 3:
+        return pts
+    if pts[0] == pts[-1]:
+        far = max(range(len(pts)), key=lambda i: (pts[i][0] - pts[0][0]) ** 2 + (pts[i][1] - pts[0][1]) ** 2)
+        if far in (0, len(pts) - 1):
+            return pts
+        return rdp(pts[:far + 1], eps)[:-1] + rdp(pts[far:], eps)
+    keep, stack = {0, len(pts) - 1}, [(0, len(pts) - 1)]
+    while stack:
+        a, b = stack.pop()
+        (x1, y1), (x2, y2) = pts[a], pts[b]
+        dx, dy = x2 - x1, y2 - y1
+        n = (dx * dx + dy * dy) ** 0.5 or 1e-12
+        i, dm = 0, 0
+        for k in range(a + 1, b):
+            d = abs(dy * pts[k][0] - dx * pts[k][1] + x2 * y1 - y2 * x1) / n
+            if d > dm:
+                i, dm = k, d
+        if dm > eps:
+            keep.add(i)
+            stack += [(a, i), (i, b)]
+    return [pts[i] for i in sorted(keep)]
+
+
+def area(r):
+    return abs(sum(r[i][1] * r[i + 1][0] - r[i + 1][1] * r[i][0] for i in range(len(r) - 1))) / 2
+
+
+def rings(ways):
+    """Assemble des segments de multipolygone en anneaux fermés."""
+    segs, out = [w for w in ways if len(w) > 1], []
+    while segs:
+        ring, changed = list(segs.pop()), True
+        while ring[0] != ring[-1] and changed:
+            changed = False
+            for i, s in enumerate(segs):
+                if s[0] == ring[-1]: ring += s[1:]
+                elif s[-1] == ring[-1]: ring += s[::-1][1:]
+                elif s[-1] == ring[0]: ring = s[:-1] + ring
+                elif s[0] == ring[0]: ring = s[::-1][:-1] + ring
+                else: continue
+                segs.pop(i)
+                changed = True
+                break
+        if ring[0] == ring[-1] and len(ring) > 3:
+            out.append(ring)
+    return out
+
+
+def build_map():
+    rows = gtfs()
+    q = lambda pts: [[round(a, 5), round(b, 5)] for a, b in pts]
+    # Tracés : les deux formes les plus utilisées de chaque ligne structurante
+    routes = {r["route_id"]: r for r in rows("routes.txt") if structuring(r)}
+    use = {}
+    for r in rows("trips.txt"):
+        if r["route_id"] in routes:
+            use.setdefault(r["route_id"], {}).setdefault(r["shape_id"], 0)
+            use[r["route_id"]][r["shape_id"]] += 1
+    shapes = {}
+    for r in rows("shapes.txt"):
+        shapes.setdefault(r["shape_id"], []).append((int(r["shape_pt_sequence"]), float(r["shape_pt_lat"]), float(r["shape_pt_lon"])))
+    lines = []
+    for rid, sh in use.items():
+        r = routes[rid]
+        best = sorted(sh.items(), key=lambda kv: -kv[1])[:2]
+        lines.append({"name": r["route_short_name"], "color": "#" + (r["route_color"] or "888888"),
+                      "text": "#" + (r["route_text_color"] or "ffffff"), "type": int(r["route_type"]),
+                      "paths": [q(rdp([(a, b) for _, a, b in sorted(shapes[s])], 0.00008)) for s, _ in best if s in shapes]})
+    lines.sort(key=lambda l: (l["type"] != 0, len(l["name"]), l["name"]))
+    # Arrêts de tram
+    stops = {r["stop_id"]: r for r in rows("stops.txt")}
+    tram_routes = {rid for rid, r in routes.items() if r["route_type"] == "0"}
+    tram_trips = {r["trip_id"] for r in rows("trips.txt") if r["route_id"] in tram_routes}
+    tram_stops = {}
+    for r in rows("stop_times.txt"):
+        if r["trip_id"] in tram_trips:
+            st = stops[r["stop_id"]]
+            name = stops.get(st["parent_station"], st)["stop_name"]
+            tram_stops.setdefault(name, [round(float(st["stop_lat"]), 5), round(float(st["stop_lon"]), 5)])
+    # Fond OpenStreetMap
+    ql = f"""[out:json][timeout:120];(
+      way["waterway"~"^(river|canal)$"]({BBOX}); way["natural"="water"]({BBOX}); relation["natural"="water"]({BBOX});
+      way["highway"~"^(motorway|trunk|primary|secondary)$"]({BBOX}); way["leisure"="park"]({BBOX});
+      node["place"~"^(suburb|quarter|town|neighbourhood)$"]({BBOX}););out geom qt;"""
+    try:  # Overpass est souvent surchargé : on garde la dernière réponse
+        raw = get(OVERPASS, urllib.parse.urlencode({"data": ql}).encode())
+        json.loads(raw)
+        (DIR / "osm.json").write_bytes(raw)
+    except Exception:
+        raw = (DIR / "osm.json").read_bytes()
+    E = json.loads(raw)["elements"]
+    geom = lambda w: [(p["lat"], p["lon"]) for p in w.get("geometry", [])]
+    water, parks, rivers, roads, places = [], [], [], [[], [], []], []
+    for e in E:
+        t = e.get("tags", {})
+        if e["type"] == "relation":
+            for ring in rings([geom(m) for m in e.get("members", []) if m.get("role") == "outer" and m.get("geometry")]):
+                if area(ring) > 2e-6:
+                    water.append(q(rdp(ring, 0.00004)))
+        elif e["type"] == "node":
+            if "name" in t:
+                places.append([t["name"], round(e["lat"], 5), round(e["lon"], 5),
+                               {"town": 0, "suburb": 1}.get(t["place"], 2)])
+        elif t.get("natural") == "water" or t.get("leisure") == "park":
+            g = geom(e)
+            if len(g) > 3 and g[0] == g[-1] and area(g) > (2e-6 if "natural" in t else 4e-6):
+                (water if "natural" in t else parks).append(q(rdp(g, 0.00004)))
+        elif t.get("waterway"):
+            rivers.append(q(rdp(geom(e), 0.00005)))
+        elif "highway" in t:
+            cls = {"motorway": 0, "trunk": 0, "primary": 1, "secondary": 2}[t["highway"]]
+            roads[cls].append(q(rdp(geom(e), 0.00007 if cls < 2 else 0.0001)))
+    (DIR / "map.json").write_text(json.dumps({
+        "lines": lines, "stops": [[n, *c] for n, c in tram_stops.items()],
+        "water": water, "parks": parks, "rivers": rivers, "roads": roads, "places": places, "ts": int(time.time())},
+        ensure_ascii=False, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    DIR.mkdir(parents=True, exist_ok=True)
+    for what in sys.argv[1:] or ["index", "day", "map"]:
+        {"index": build_index, "day": build_day, "map": build_map}[what]()

@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Windows-like edge snapping while dragging a window with Super+left click.
+
+Started by a non-consuming bind on Super+mouse:272 (next to `bindm … movewindow`).
+Follows the cursor until the left button is released (read from evdev: the user is in
+the `input` group), shows the target zone through Quickshell (`qs -c snapzone`) and,
+on release, snaps the window with hypr-snap:
+  top edge = maximise (usable area), left/right edge = half, corners = quarter.
+Dropping a snapped window anywhere else gives back its size (or tiling) from before.
+"""
+import importlib.machinery, json, os, selectors, socket, subprocess, sys, time
+
+import evdev
+from evdev import ecodes
+
+EDGE = 8          # px from a screen edge that triggers a zone
+CORNER = 0.2      # part of an edge (from each end) that means a corner
+POLL = 0.025      # s between cursor reads
+
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+PIDFILE = os.path.join(RUN, "hypr-dragsnap.pid")
+SOCK = os.path.join(RUN, "hypr", os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""), ".socket.sock")
+snap = importlib.machinery.SourceFileLoader(
+    "hypr_snap", os.path.expanduser("~/.local/bin/hypr-snap")).load_module()
+
+def hypr(cmd):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.connect(SOCK)
+        s.sendall(cmd.encode())
+        data = b""
+        while chunk := s.recv(65536):
+            data += chunk
+    return data.decode()
+
+def hypr_json(what):
+    return json.loads(hypr("j/" + what))
+
+def dispatch(*cmds):
+    hypr("[[BATCH]]" + ";".join("dispatch " + c for c in cmds))
+
+def preview(*args):
+    subprocess.Popen(["qs", "-c", "snapzone", "ipc", "call", "snapzone", *args[:1], *([" ".join(map(str, args[1:]))] if len(args) > 1 else [])],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def monitor_at(mons, x, y):
+    for m in mons:
+        w, h = m["width"] / m["scale"], m["height"] / m["scale"]
+        if m["x"] <= x < m["x"] + w and m["y"] <= y < m["y"] + h:
+            return m
+    return None
+
+def zone_at(m, x, y):
+    w, h = m["width"] / m["scale"], m["height"] / m["scale"]
+    rx, ry = (x - m["x"]) / w, (y - m["y"]) / h
+    top, bottom = y - m["y"] < EDGE, m["y"] + h - y <= EDGE
+    left, right = x - m["x"] < EDGE, m["x"] + w - x <= EDGE
+    if left or right:
+        side = "l" if left else "r"
+        if ry < CORNER:
+            return "t" + side
+        if ry > 1 - CORNER:
+            return "b" + side
+        return "left" if left else "right"
+    if top:
+        return "tl" if rx < CORNER else "tr" if rx > 1 - CORNER else "max"
+    if bottom:
+        return "bl" if rx < CORNER else "br" if rx > 1 - CORNER else None
+    return None
+
+def already_running():
+    try:
+        with open(PIDFILE) as f:
+            pid = int(f.read())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"hypr-dragsnap" in f.read()
+    except (OSError, ValueError):
+        return False
+
+def has_left_button(path):
+    """Read the key bitmap from sysfs: opening every input device is slow (~0.4 s)."""
+    try:
+        with open(f"/sys/class/input/{os.path.basename(path)}/device/capabilities/key") as f:
+            words = f.read().split()
+    except OSError:
+        return False
+    bits = int("".join(w.zfill(16) for w in words), 16)   # sysfs words are 64-bit, most significant first
+    return bool(bits >> ecodes.BTN_LEFT & 1)
+
+def mice():
+    devs = []
+    for path in evdev.list_devices():
+        if has_left_button(path):
+            try:
+                devs.append(evdev.InputDevice(path))
+            except OSError:
+                pass
+    return devs
+
+def restore(win, addr, info, cx):
+    """Window dragged out of its zone: back to its size (or to tiling) from before the snap."""
+    if not info["floating"]:
+        dispatch(f"settiled address:{addr}")
+        return
+    w, h = info["size"]
+    # Keep the grabbed point under the cursor, horizontally (like Windows)
+    ratio = (cx - win["at"][0]) / max(win["size"][0], 1)
+    x = round(cx - ratio * w)
+    dispatch(f"resizewindowpixel exact {w} {h},address:{addr}",
+             f"movewindowpixel exact {x} {win['at'][1]},address:{addr}")
+
+def main():
+    if already_running():
+        return
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    devs = mice()
+    # Quick click: the button may already be up
+    if not any(ecodes.BTN_LEFT in d.active_keys() for d in devs):
+        return
+    win = hypr_json("activewindow")
+    addr = win.get("address")
+    if not addr or win.get("fullscreen"):
+        return
+    mons = hypr_json("monitors")
+
+    sel = selectors.DefaultSelector()
+    for d in devs:
+        sel.register(d, selectors.EVENT_READ)
+
+    zone, mon, cur = None, None, (0, 0)
+    released = False
+    while not released:
+        for key, _ in sel.select(POLL):
+            for ev in key.fileobj.read():
+                if ev.type == ecodes.EV_KEY and ev.code == ecodes.BTN_LEFT and ev.value == 0:
+                    released = True
+        pos = hypr_json("cursorpos")
+        cur = (pos["x"], pos["y"])
+        m = monitor_at(mons, *cur)
+        z = zone_at(m, *cur) if m else None
+        if (z, m and m["name"]) != (zone, mon and mon["name"]):
+            zone, mon = z, m
+            if zone:
+                x, y, w, h = snap.zone_rect(mon, zone)
+                preview("preview", mon["name"], x - mon["x"], y - mon["y"], w, h)
+            else:
+                preview("hide")
+
+    if zone:
+        preview("hide")
+    time.sleep(0.03)    # let Hyprland finish its own drop first
+    if zone:
+        snap.main(addr, mon["activeWorkspace"]["id"], zone)
+        return
+    state = snap.load_state()
+    info = state.get(addr)
+    if not info:
+        return
+    win = next((c for c in hypr_json("clients") if c["address"] == addr), None)
+    if win and win["floating"] and [*win["at"], *win["size"]] != info.get("rect"):
+        del state[addr]
+        snap.save_state(state)
+        restore(win, addr, info, cur[0])
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        try:
+            os.remove(PIDFILE)
+        except OSError:
+            pass

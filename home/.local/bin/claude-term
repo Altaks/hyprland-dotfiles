@@ -1,0 +1,4 @@
+#!/bin/bash
+# Opens a new Ptyxis window running Claude Code; drops to a shell when it exits.
+# setsid: detach from the caller (Waybar kills its on-click children when it reloads).
+exec setsid -f ptyxis --new-window -d "${1:-$HOME}" -x "bash -lc 'claude; exec bash'"

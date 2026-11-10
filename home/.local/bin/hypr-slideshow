@@ -1,0 +1,38 @@
+#!/bin/bash
+# Wallpaper slideshow (images and videos).
+# Usage: hypr-slideshow start [minutes] [folder] | stop | toggle [minutes] [folder] | status
+# The folder defaults to the whole library; minutes default to 10.
+dir="$HOME/.cache/hypr-wallpaper"; mkdir -p "$dir"
+# The PID lives in the runtime dir (wiped at reboot) and is checked against our own cmdline:
+# a stale PID from a previous boot can belong to another process (it once killed Hyprland).
+pidfile="${XDG_RUNTIME_DIR:-/tmp}/hypr-slideshow.pid"
+library="${WALLPAPER_LIBRARY:-$HOME/Pictures/backgrounds}"
+
+running() { [ -f "$pidfile" ] && grep -qa hypr-slideshow "/proc/$(cat "$pidfile")/cmdline" 2>/dev/null; }
+
+case "${1:-status}" in
+    start)
+        minutes="${2:-10}"
+        folder="$(readlink -f "${3:-$library}")"
+        running && kill "$(cat "$pidfile")"
+        printf '%s\n%s\n' "$minutes" "$folder" > "$dir/slideshow"
+        (
+            while true; do
+                current="$(cat "$dir/current" 2>/dev/null)"
+                next="$(find "$folder" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \
+                        -o -iname '*.mp4' -o -iname '*.webm' -o -iname '*.mkv' -o -iname '*.mov' \) \
+                        ! -path "$current" | shuf -n1)"
+                [ -n "$next" ] && HYPR_SLIDESHOW=1 hypr-wallpaper "$next"
+                sleep "$((minutes * 60))"
+            done
+        ) >/dev/null 2>&1 &
+        echo $! > "$pidfile"
+        notify-send -a "Fond d'écran" "Diaporama activé" "$(basename "$folder") · changement toutes les $minutes min" ;;
+    stop)
+        if running; then kill "$(cat "$pidfile")"; notify-send -a "Fond d'écran" "Diaporama arrêté"; fi
+        rm -f "$pidfile" "$dir/slideshow" ;;
+    toggle)
+        if running; then "$0" stop; else "$0" start "${2:-10}" "${3:-$library}"; fi ;;
+    status)
+        running && echo "on $(head -1 "$dir/slideshow")" || echo off ;;
+esac

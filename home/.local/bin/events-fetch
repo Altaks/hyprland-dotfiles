@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""Sorties à Nantes pour le tableau de bord Quickshell (onglet Agenda, carte « Sortir à Nantes »).
+
+Sources :
+  - agenda open data de Nantes Métropole (data.nantesmetropole.fr, jeu
+    244400404_agenda-evenements-nantes-metropole_v2), 7 prochains jours, hors annulés et hors
+    activités réservées aux enfants. Son champ lien_agenda (/infonantes/agenda/<id>) renvoie un 404
+    depuis que le site est passé sur OpenAgenda : on retrouve la fiche OpenAgenda (agenda 82470621)
+    par le nom du fichier image, sinon par le titre → /que-faire-a-nantes/agenda/<uid>_<slug> ;
+  - meetups physiques autour de Nantes (API GraphQL publique de Meetup : recommendedEvents + eventSearch
+    dans la catégorie Technology, marqués « Tech ») ;
+  - grandes salles sur 3 mois (FAR_DAYS) : agenda de la Cité des Congrès (spectacles à la Cité et au LAPS)
+    et salons grand public d'Exponantes (Parc des Expositions de la Beaujoire, API WordPress + dates lues
+    dans la page agenda), plus les « Salon » de l'open data au-delà des 7 jours.
+Étiquettes ajoutées : « Convention » / « Pop culture » (mots-clés dans le titre), « Salon » ; les
+catégories d'un événement qui en coche 8 ou plus (spam de catégories) sont ignorées.
+Temps de trajet à pied et à vélo depuis « home » (~/.config/quickshell/naolib.json, adresse géocodée
+par la BAN), sinon depuis le premier arrêt suivi ; une requête OSRM « table » par mode
+(routing.openstreetmap.de).
+
+  events-fetch [--force] [--home "adresse"]
+Output: one JSON document on stdout {"events": [...], "origin", "ts"}, chaque événement
+{"id", "source" (nantes|meetup|cite|expo), "title", "date", "start", "end", "ts", "place", "city", "types",
+ "free", "price", "desc", "link", "thumb", "more", "lat", "lon", "walk", "bike" (minutes ou null),
+ "route" (itinéraire Google Maps en transports), "group"/"going" pour les meetups}.
+Cached 1 h in ~/.cache/dashboard-events.json ; vignettes JPEG 240 px dans ~/.cache/dashboard-events/.
+"""
+import hashlib, html, io, json, re, sys, time, unicodedata, urllib.parse, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from PIL import Image
+
+CACHE = Path.home() / ".cache/dashboard-events.json"
+THUMBS = Path.home() / ".cache/dashboard-events"
+GEOCACHE = Path.home() / ".cache/dashboard-events-home.json"
+CONFIG = Path.home() / ".config/quickshell/naolib.json"
+NAOLIB_INDEX = Path.home() / ".cache/dashboard-naolib/index.json"
+TTL = 3600
+DAYS = 7
+FAR_DAYS = 90   # salons, conventions et grandes salles : annoncés longtemps à l'avance
+CENTER = (47.2184, -1.5536)  # Nantes, place Royale
+API = ("https://data.nantesmetropole.fr/api/explore/v2.1/catalog/datasets/"
+       "244400404_agenda-evenements-nantes-metropole_v2/records")
+OPENAGENDA = "https://openagenda.com/agendas/82470621/events.v2.json"
+SITE = "https://metropole.nantes.fr/que-faire-a-nantes/agenda"
+MEETUP = "https://api.meetup.com/gql-ext"
+OSRM = "https://routing.openstreetmap.de/routed-{}/table/v1/driving/"
+CITE = "https://lacite-nantes.fr/agenda-spectacles-concerts-salons.html"
+EXPO_PAGE = "https://www.exponantes.com/agenda-des-evenements-du-parc/"
+EXPO_API = "https://www.exponantes.com/wp-json/wp/v2/evenement"
+VENUES = {  # lieu → (lat, lon)
+    "cite": ("La Cité des Congrès", "Nantes", 47.2128, -1.5431),
+    "parc": ("Parc des Expositions de la Beaujoire", "Nantes", 47.2563, -1.5233),
+}
+UA = "Mozilla/5.0 (dashboard events)"
+
+
+def get(url, timeout=20, data=None, headers=None):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def norm(s):
+    s = unicodedata.normalize("NFKD", re.sub(r"[’'`]", " ", s or "")).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def img_key(name):
+    """« …/8fa5…6d8f.base.image.jpg » → « 8fa5…6d8f »."""
+    return (name or "").rsplit("/", 1)[-1].split(".", 1)[0]
+
+
+# ---------------------------------------------------------------- Nantes Métropole (open data)
+
+def records(first=0, last=DAYS, extra=""):
+    today = date.today()
+    where = (f'date >= "{today + timedelta(days=first)}" and date <= "{today + timedelta(days=last)}" '
+             f'and annule = "non" and reporte = "non"' + (f" and ({extra})" if extra else ""))
+    out, offset = [], 0
+    while True:
+        q = urllib.parse.urlencode({"where": where, "order_by": "date, heure_debut", "limit": 100, "offset": offset})
+        page = json.loads(get(f"{API}?{q}"))["results"]
+        out += page
+        offset += 100
+        if len(page) < 100 or offset >= 1000:
+            return out
+
+
+def openagenda_links():
+    """{clé image → url, titre normalisé → url} des fiches du site de la métropole (OpenAgenda)."""
+    today = date.today()
+    by_img, by_title, start = {}, {}, 0
+    while start < 2000:
+        q = urllib.parse.urlencode({"size": 300, "from": start,
+                                    "timings[gte]": f"{today}T00:00:00",
+                                    "timings[lte]": f"{today + timedelta(days=DAYS)}T23:59:59"})
+        page = json.loads(get(f"{OPENAGENDA}?{q}"))["events"]
+        for e in page:
+            url = f"{SITE}/{e['uid']}_{e['slug']}"
+            if (e.get("image") or {}).get("filename"):
+                by_img[img_key(e["image"]["filename"])] = url
+            title = (e.get("title") or {}).get("fr") or ""
+            by_title.setdefault(norm(title), url)
+        start += 300
+        if len(page) < 300:
+            break
+    return by_img, by_title
+
+
+def kids_only(r):
+    """Atelier/spectacle pour enfants : âge maximum < 16, ou public jeune sans adulte."""
+    pub = (r.get("precisions_public") or "").lower()
+    m = re.search(r"age maximum\s*:\s*(\d+)", pub)
+    if m and int(m[1]) < 16:
+        return True
+    return "jeune public" in pub and "adulte" not in pub and "tout public" not in pub
+
+
+def price(r):
+    if r.get("gratuit") == "oui":
+        return "Gratuit"
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:€|euros?)", r.get("precisions_tarifs_evt") or "", re.I)
+    return f"{m[1].replace('.', ',')} €" if m else ""
+
+
+def nantes_events(now):
+    recs = records()
+    try:  # au-delà de la semaine : seulement les salons
+        recs += records(DAYS + 1, FAR_DAYS, 'types_libelles = "Salon"')
+    except Exception:
+        pass
+    try:
+        by_img, by_title = openagenda_links()
+    except Exception:
+        by_img, by_title = {}, {}
+    seen, events = {}, []
+    for r in recs:
+        if kids_only(r) or not r.get("nom"):
+            continue
+        start = r.get("heure_debut") or ""
+        end = r.get("heure_fin") or ""
+        try:
+            ts = datetime.fromisoformat(f"{r['date']}T{start or '00:00'}")
+            if end and datetime.fromisoformat(f"{r['date']}T{end}") < now:
+                continue  # déjà fini aujourd'hui
+        except ValueError:
+            continue
+        if r["id_manif"] in seen:  # même événement à plusieurs dates : on garde la première
+            seen[r["id_manif"]]["more"] += 1
+            continue
+        title = r["nom"].strip()
+        link = (by_img.get(img_key(r.get("media_url"))) or by_title.get(norm(title)) or r.get("url_site")
+                or f"{SITE}?{urllib.parse.urlencode({'oaq[search]': title})}")
+        ll = r.get("location_latlong") or {}
+        desc = " ".join((r.get("description_evt") or "").split())
+        ev = {"id": r["id_manif"], "source": "nantes", "title": title, "date": r["date"], "start": start,
+              "end": end, "ts": int(ts.timestamp()), "place": r.get("lieu") or "", "city": r.get("ville") or "",
+              "types": clean_types(r.get("types_libelles")), "free": r.get("gratuit") == "oui",
+              "price": price(r), "desc": desc[:220], "link": link, "image": r.get("media_url") or "",
+              "lat": ll.get("lat"), "lon": ll.get("lon"), "more": 0}
+        seen[r["id_manif"]] = ev
+        events.append(ev)
+    return events
+
+
+def clean_types(types):
+    types = [t for t in (types or []) if t]
+    return [] if len(types) >= 8 else types  # « toutes les catégories » cochées = aucune information
+
+
+# ---------------------------------------------------------------- Cité des Congrès + Exponantes
+
+CITE_TYPES = {"Concert": "Concert - Musique", "Classique": "Concert - Musique", "Humour": "Théâtre - Humour",
+              "Théâtre": "Théâtre - Humour", "Danse": "Danse - Performance - Bal", "Spectacle": "Spectacle",
+              "Festival": "Fête - Festival", "Congrès Exposition": "Salon"}
+EXPO_TYPES = {"salon": "Salon", "concert": "Concert - Musique", "humour": "Théâtre - Humour",
+              "theatre": "Théâtre - Humour", "spectacle": "Spectacle", "festival": "Fête - Festival",
+              "danse": "Danse - Performance - Bal", "classique": "Concert - Musique"}
+
+
+def venue_event(src, key, title, d0, d1, types, link, image, venue):
+    name, city, lat, lon = VENUES[venue]
+    return {"id": f"{src}-{key}", "source": src, "title": title, "date": d0.isoformat(), "start": "", "end": "",
+            "ts": int(datetime.combine(d0, datetime.min.time()).timestamp()), "place": name, "city": city,
+            "types": types, "free": False, "price": "", "desc": "", "link": link, "image": image,
+            "lat": lat, "lon": lon, "more": 0, "until": d1.isoformat() if d1 and d1 != d0 else ""}
+
+
+def in_window(d0, d1):
+    today = date.today()
+    return (d1 or d0) >= today and d0 <= today + timedelta(days=FAR_DAYS)
+
+
+def cancelled(title):
+    return bool(re.search(r"\bannul", norm(title)))
+
+
+def cite_events():
+    """Agenda grand public de la Cité des Congrès (spectacles à la Cité et au LAPS du Parc des Expos)."""
+    h = get(CITE).decode("utf-8", "ignore")
+    out = []
+    for li in h.split('itemtype="http://schema.org/Event"')[1:]:
+        m = re.search(r'<h3><a href="([^"]+)"[^>]*><span itemprop="name">(.*?)</span>', li, re.S)
+        d0 = re.search(r'itemprop="startDate" content="(\d{4}-\d\d-\d\d)"', li)
+        if not m or not d0:
+            continue
+        title = html.unescape(re.sub(r"<[^>]+>", "", m[2])).strip()
+        d1 = re.search(r'itemprop="endDate" content="(\d{4}-\d\d-\d\d)"', li)
+        d0, d1 = date.fromisoformat(d0[1]), date.fromisoformat(d1[1]) if d1 else None
+        if cancelled(title) or not in_window(d0, d1):
+            continue
+        cat = html.unescape(re.search(r'itemprop="additionalType">([^<]*)<', li)[1]).strip() \
+            if 'itemprop="additionalType"' in li else ""
+        place = re.search(r'event-info--place">(.*?)</span>', li, re.S)
+        place = re.sub(r"<[^>]+>", "", place[1]).strip() if place else ""
+        img = re.search(r'data-lazy-src="([^"]+)"', li) or re.search(r'<img[^>]+src="(http[^"]+)"', li)
+        out.append(venue_event("cite", m[1].rsplit("/", 1)[-1].removesuffix(".html"), title, d0, d1,
+                               [CITE_TYPES[cat]] if cat in CITE_TYPES else [], m[1].replace("http://", "https://"),
+                               img[1] if img else "", "parc" if "parc" in norm(place) else "cite"))
+    return out
+
+
+def expo_events():
+    """Salons et spectacles grand public du Parc des Expositions (Exponantes) : titres et thèmes par l'API
+    WordPress, dates « Du 14/11/2026 au 15/11/2026 » lues dans la page agenda (absentes de l'API)."""
+    api = json.loads(get(f"{EXPO_API}?per_page=100&_fields=link,title,class_list"))
+    titles = {e["link"]: html.unescape(e["title"]["rendered"]).strip() for e in api}
+    h = get(EXPO_PAGE).decode("utf-8", "ignore")
+    out = []
+    for it in h.split('<div data-elementor-type="loop-item"')[1:]:
+        cls = re.search(r'class="([^"]*e-loop-item[^"]*)"', it)
+        href = re.search(r'href="(https://www\.exponantes\.com/evenement/[^"]+)"', it)
+        dates = re.findall(r"(\d\d)/(\d\d)/(\d{4})", " ".join(re.findall(r'elementor-icon-list-text">([^<]*)<', it)))
+        if not cls or not href or not dates or "type-evenement-grand-public" not in cls[1]:
+            continue  # salons professionnels et congrès : pas pour une sortie
+        d0, d1 = [date(int(y), int(mo), int(d)) for d, mo, y in dates[:2]] + [None] * (2 - len(dates[:2]))
+        title = titles.get(href[1]) or href[1].rstrip("/").rsplit("/", 1)[-1].replace("-", " ").title()
+        if cancelled(title) or not in_window(d0, d1):
+            continue
+        themes = [c.removeprefix("theme-evenement-") for c in cls[1].split() if c.startswith("theme-evenement-")]
+        img = re.search(r'<img[^>]+src="([^"]+)"', it)
+        out.append(venue_event("expo", href[1].rstrip("/").rsplit("/", 1)[-1], title, d0, d1,
+                               list(dict.fromkeys(EXPO_TYPES[t] for t in themes if t in EXPO_TYPES)),
+                               href[1], img[1] if img else "", "parc"))
+    return out
+
+
+def venues_events(now):
+    out, errors = [], []
+    for name, fn in (("Cité des Congrès", cite_events), ("Exponantes", expo_events)):
+        try:
+            out += fn()
+        except Exception as e:
+            errors.append(f"{name} : {e}")
+    if errors and not out:
+        raise RuntimeError(" · ".join(errors))
+    return out
+
+
+# Conventions et pop culture : mots-clés cherchés dans le titre (normalisé, sans accents).
+CONVENTION_RE = re.compile(r"\b(convention|comic ?con|cosplay|japan ?expo|geek|utopiales|art to play|"
+                           r"festival du jeu|salon du jeu|jeux? de role|retro ?gaming|esport|e sport|lan party)\b")
+POPCULT_RE = re.compile(r"\b(manga|anime|animes|japanim\w*|otaku|comics?|bande dessinee|science fiction|"
+                        r"fantasy|star wars|harry potter|pokemon|zelda|final fantasy|hollow knight|undertale|"
+                        r"miyazaki|ghibli|marvel|jeux? video|video ?games?|k ?pop|cinema fantastique|"
+                        r"jeux? de societe|warhammer|figurines?|concert on titan|dragon ball|one piece|naruto)\b")
+
+
+def tag(events):
+    for e in events:
+        t = norm(e["title"])
+        extra = (["Convention"] if CONVENTION_RE.search(t) else []) + (["Pop culture"] if POPCULT_RE.search(t) else [])
+        if re.search(r"\bsalons?\b", t) and "Salon" not in e["types"]:
+            extra.append("Salon")
+        e["types"] = extra + [x for x in e["types"] if x not in extra]
+
+
+TITLE_STOP = {"festival", "salon", "de", "du", "des", "la", "le", "les", "l", "et", "a", "au", "nantes", "edition"}
+
+
+def merge_venues(events, venues):
+    """Ajoute les événements des grandes salles sans doublon (même titre le même jour qu'un événement de
+    l'open data) ; un spectacle joué plusieurs fois dans la même salle devient « +N dates »."""
+    def words(t):  # « Festival Art to Play 2026 » ≈ « Art to Play »
+        return set(norm(t).split()) - TITLE_STOP - {w for w in norm(t).split() if w.isdigit()}
+
+    def same(e, v):
+        a, b = words(e["title"]), words(v["title"])
+        return bool(a and b) and (a <= b or b <= a) and v["date"] <= e["date"] <= (v["until"] or v["date"])
+
+    known = {(norm(e["title"]), e["date"]) for e in events}
+    first = {}
+    for v in sorted(venues, key=lambda v: v["date"]):
+        k = norm(v["title"])
+        if (k, v["date"]) in known or any(same(e, v) for e in events if e["source"] == "nantes"):
+            continue
+        known.add((k, v["date"]))
+        if k in first:
+            first[k]["more"] += 1
+            continue
+        first[k] = v
+        events.append(v)
+
+
+# ---------------------------------------------------------------- Meetup
+
+MEETUP_FIELDS = """edges { node { id title dateTime endTime eventUrl status description eventType
+      group { name topicCategory { id } } venue { name address city lat lon }
+      featuredEventPhoto { highResUrl } feeSettings { amount currency } rsvps { totalCount } } }"""
+MEETUP_RECOMMENDED = """query($f: RecommendedEventsFilter!, $after: String) {
+  recommendedEvents(filter: $f, first: 100, after: $after) { pageInfo { hasNextPage endCursor } %s } }""" % MEETUP_FIELDS
+MEETUP_SEARCH = """query($f: EventSearchFilter!) { eventSearch(filter: $f, first: 100) { %s } }""" % MEETUP_FIELDS
+TECH_CATEGORY = "546"  # topicCategory « Technology » de Meetup
+# eventSearch exige un mot-clé : on balaie la catégorie Technology avec plusieurs termes, car les
+# recommandations seules ne remontent qu'une partie des meetups tech (Flutter, Le Wagon, IT Women…).
+TECH_QUERIES = ["tech", "développeur", "dev", "data", "IA", "intelligence artificielle", "web", "cloud",
+                "devops", "cybersécurité", "python", "java", "javascript", "agile", "startup", "code", "UX"]
+
+
+def meetup_gql(query, variables):
+    body = json.dumps({"query": query, "variables": variables}).encode()
+    d = json.loads(get(MEETUP, data=body, headers={"Content-Type": "application/json"}))
+    if d.get("errors"):
+        raise RuntimeError(d["errors"][0].get("message", "Meetup"))
+    return d["data"]
+
+
+def meetup_events(now):
+    today = date.today()
+    tz = now.astimezone().strftime("%z")
+    tz = f"{tz[:3]}:{tz[3:]}"
+    span = {"lat": CENTER[0], "lon": CENTER[1], "radius": 12,
+            "startDateRange": f"{today}T00:00:00{tz}", "endDateRange": f"{today + timedelta(days=DAYS)}T23:59:59{tz}"}
+
+    def recommended():
+        out, after = [], None
+        for _ in range(5):
+            res = meetup_gql(MEETUP_RECOMMENDED, {"f": {**span, "eventType": "PHYSICAL", "country": "fr"},
+                                                  "after": after})["recommendedEvents"]
+            out += [e["node"] for e in res["edges"]]
+            if not res["pageInfo"]["hasNextPage"]:
+                return out
+            after = res["pageInfo"]["endCursor"]
+        return out
+
+    def tech(word):
+        try:
+            res = meetup_gql(MEETUP_SEARCH, {"f": {**span, "query": word, "topicCategoryId": TECH_CATEGORY,
+                                                   "eventType": "PHYSICAL"}})["eventSearch"]
+            return [e["node"] for e in res["edges"]]
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(6) as pool:
+        frec = pool.submit(recommended)
+        searches = list(pool.map(tech, TECH_QUERIES))
+        nodes = frec.result()
+    byid = {n["id"]: n for n in nodes}
+    for found in searches:
+        for n in found:
+            byid.setdefault(n["id"], n)
+    nodes = [n for n in byid.values() if (n.get("eventType") or "PHYSICAL") != "ONLINE"]
+
+    seen, events = {}, []
+    for n in sorted(nodes, key=lambda n: n.get("dateTime") or ""):
+        if (n.get("status") or "").upper() in ("CANCELLED", "DELETED", "DRAFT") or not n.get("dateTime"):
+            continue
+        b = datetime.fromisoformat(n["dateTime"]).astimezone()
+        e = datetime.fromisoformat(n["endTime"]).astimezone() if n.get("endTime") else None
+        if (e or b) < now.astimezone():
+            continue
+        group = (n.get("group") or {}).get("name") or ""
+        key = (group, n["title"].strip())
+        if key in seen:  # meetup récurrent : une seule ligne
+            seen[key]["more"] += 1
+            continue
+        v = n.get("venue") or {}
+        fee = n.get("feeSettings") or {}
+        amount = fee.get("amount")
+        desc = " ".join(re.sub(r"[*_#>`\[\]]", "", n.get("description") or "").split())
+        ev = {"id": "mu-" + n["id"], "source": "meetup", "title": n["title"].strip(), "date": b.date().isoformat(),
+              "start": b.strftime("%H:%M"), "end": e.strftime("%H:%M") if e and e.date() == b.date() else "",
+              "ts": int(b.timestamp()), "place": v.get("name") or v.get("address") or "",
+              "city": (v.get("city") or "").title(), "free": not amount,
+              "types": ["Meetup"] + (["Tech"] if ((n.get("group") or {}).get("topicCategory") or {}).get("id") == TECH_CATEGORY else []),
+              "price": f"{amount:g} €".replace(".", ",") if amount else "", "desc": desc[:220],
+              "link": n.get("eventUrl") or "", "image": (n.get("featuredEventPhoto") or {}).get("highResUrl") or "",
+              "lat": v.get("lat") or None, "lon": v.get("lon") or None, "group": group,
+              "going": (n.get("rsvps") or {}).get("totalCount") or 0, "more": 0}
+        seen[key] = ev
+        events.append(ev)
+    return events
+
+
+# ---------------------------------------------------------------- temps de trajet
+
+def origin():
+    """(lat, lon, libellé) du point de départ : « home » géocodé, sinon premier arrêt suivi."""
+    try:
+        cfg = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    home = (cfg.get("home") or "").strip()
+    if home:
+        try:
+            cache = json.loads(GEOCACHE.read_text())
+            if cache.get("q") == home:
+                return cache["lat"], cache["lon"], cache["label"]
+        except (OSError, ValueError, KeyError):
+            pass
+        try:
+            q = urllib.parse.urlencode({"q": home, "limit": 1})
+            feat = json.loads(get(f"https://api-adresse.data.gouv.fr/search/?{q}"))["features"][0]
+            lon, lat = feat["geometry"]["coordinates"]
+            out = {"q": home, "lat": lat, "lon": lon, "label": feat["properties"]["label"]}
+            GEOCACHE.write_text(json.dumps(out, ensure_ascii=False))
+            return lat, lon, out["label"]
+        except Exception:
+            pass
+    stops = cfg.get("stops") or []
+    if stops:  # coordonnées de l'arrêt dans le GTFS en cache (stops.txt)
+        try:
+            import csv, zipfile
+            with zipfile.ZipFile(NAOLIB_INDEX.parent / "gtfs.zip") as z, z.open("stops.txt") as f:
+                for row in csv.DictReader(io.TextIOWrapper(f, "utf-8-sig")):
+                    if row.get("stop_name") == stops[0]:
+                        return float(row["stop_lat"]), float(row["stop_lon"]), stops[0]
+        except Exception:
+            pass
+    return None
+
+
+def travel(events, org):
+    """Ajoute walk/bike (minutes) à chaque événement géolocalisé."""
+    pts = sorted({(round(e["lat"], 5), round(e["lon"], 5)) for e in events if e.get("lat") and e.get("lon")})
+    times = {"foot": {}, "bike": {}}
+
+    def table(mode, chunk):
+        coords = ";".join(f"{lon},{lat}" for lat, lon in [org[:2], *chunk])
+        d = json.loads(get(f"{OSRM.format(mode)}{coords}?sources=0&annotations=duration", timeout=30))
+        return mode, chunk, d["durations"][0][1:]
+
+    # Séquentiel : le serveur public refuse les requêtes simultanées (≈ 1 req/s).
+    for mode, chunk in [(m, pts[i:i + 90]) for m in times for i in range(0, len(pts), 90)]:
+        for attempt in range(3):
+            try:
+                _, _, durs = table(mode, chunk)
+                break
+            except Exception:
+                time.sleep(1.5 * (attempt + 1))
+        else:
+            continue
+        for p, s in zip(chunk, durs):
+            if s is not None:
+                times[mode][p] = max(1, round(s / 60))
+    for e in events:
+        p = (round(e["lat"], 5), round(e["lon"], 5)) if e.get("lat") and e.get("lon") else None
+        e["walk"] = times["foot"].get(p)
+        e["bike"] = times["bike"].get(p)
+        e["route"] = ("https://www.google.com/maps/dir/?" + urllib.parse.urlencode(
+            {"api": 1, "origin": f"{org[0]},{org[1]}", "destination": f"{p[0]},{p[1]}", "travelmode": "transit"})
+            if p else "")
+
+
+# ---------------------------------------------------------------- main
+
+def thumb(url):
+    if not url:
+        return ""
+    path = THUMBS / (hashlib.sha1(url.encode()).hexdigest()[:16] + ".jpg")
+    if path.exists():
+        return str(path)
+    try:
+        img = Image.open(io.BytesIO(get(url))).convert("RGB")
+        img.thumbnail((240, 240))
+        img.save(path, "JPEG", quality=82)
+        return str(path)
+    except Exception:
+        return ""
+
+
+def main():
+    args = sys.argv[1:]
+    force = "--force" in args
+    if "--home" in args:  # events-fetch --home "rue …, 44000 Nantes" (partagé avec route-fetch)
+        try:
+            cfg = json.loads(CONFIG.read_text())
+        except (OSError, ValueError):
+            cfg = {}
+        cfg["home"] = " ".join(args[args.index("--home") + 1:]).strip()
+        CONFIG.write_text(json.dumps(cfg, ensure_ascii=False))
+        force = True
+    try:
+        cached = json.loads(CACHE.read_text())
+    except (OSError, ValueError):
+        cached = None
+    if cached and not force and time.time() - cached.get("ts", 0) < TTL:
+        print(json.dumps(cached))
+        return
+
+    now = datetime.now()
+    with ThreadPoolExecutor(4) as pool:
+        fn, fm, fo = pool.submit(nantes_events, now), pool.submit(meetup_events, now), pool.submit(origin)
+        fv = pool.submit(venues_events, now)
+        errors = []
+        try:
+            events = fn.result()
+        except Exception as e:
+            events, _ = [], errors.append(f"Nantes : {e}")
+        try:
+            events += fm.result()
+        except Exception as e:
+            errors.append(f"Meetup : {e}")
+        try:
+            merge_venues(events, fv.result())
+        except Exception as e:
+            errors.append(str(e))
+        org = fo.result()
+    if not events:
+        print(json.dumps(cached or {"error": " · ".join(errors) or "aucun événement"}))
+        return
+    tag(events)
+    events.sort(key=lambda e: (e["date"], e["start"] or "00:00", e["title"]))
+
+    if org:
+        travel(events, org)
+    THUMBS.mkdir(parents=True, exist_ok=True)
+    with ThreadPoolExecutor(8) as pool:
+        for ev, t in zip(events, pool.map(thumb, [e.pop("image") for e in events])):
+            ev["thumb"] = t
+    out = {"events": events, "origin": org[2] if org else "", "warnings": errors, "ts": int(time.time())}
+    CACHE.write_text(json.dumps(out))
+    print(json.dumps(out))
+
+
+if __name__ == "__main__":
+    main()

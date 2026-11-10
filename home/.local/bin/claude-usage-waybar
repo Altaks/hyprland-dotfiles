@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Waybar module: Claude Code plan usage (5-hour and weekly windows).
+
+Read-only: uses Claude Code's current access token and never refreshes it,
+so it cannot invalidate a running Claude Code session.
+
+One shared cache for every bar instance (one per monitor): the API is called
+at most once per CACHE_TTL, and after a 429 we back off (Retry-After, or
+BACKOFF by default) while still showing the last known values.
+"""
+import fcntl, json, locale, subprocess, time, urllib.error, urllib.request
+from datetime import datetime
+from pathlib import Path
+
+CACHE_TTL = 300   # seconds between two real API calls
+BACKOFF = 900     # pause after a 429 when the server gives no Retry-After
+CACHE = Path.home() / ".cache/claude-usage-waybar.json"
+locale.setlocale(locale.LC_TIME, "fr_FR.UTF-8")
+
+def out(text, tooltip, cls):
+    print(json.dumps({"text": text, "tooltip": tooltip, "class": cls}))
+    raise SystemExit
+
+def render(data, note=""):
+    def window(key, label):
+        w = data.get(key) or {}
+        if w.get("utilization") is None:
+            return None
+        pct = round(float(w["utilization"]))
+        reset = ""
+        if w.get("resets_at"):
+            reset = datetime.fromisoformat(w["resets_at"]).astimezone().strftime(" (reset %a %H:%M)")
+        return pct, f"{label} : {pct} %{reset}"
+
+    parts = [w for w in (window("five_hour", "5 h"), window("seven_day", "7 jours")) if w]
+    if not parts:
+        out("—", "Pas de données d'usage" + note, "off")
+    # Tokens and API-price equivalent from the local transcripts (claude-tokens)
+    try:
+        t = json.loads(subprocess.run([str(Path.home() / ".local/bin/claude-tokens")],
+                                      capture_output=True, text=True, timeout=10).stdout)
+        fmt = lambda n: f"{n / 1e6:.1f} M".replace(".", ",")
+        usd = lambda c: f"{c:.2f} $".replace(".", ",")
+        note = (f"\nTokens : {fmt(t['session']['tokens'])} (5 h) · {fmt(t['week']['tokens'])} (7 jours)"
+                f"\nÉquivalent API : {usd(t['session']['cost'])} (5 h) · {usd(t['week']['cost'])} (7 jours)") + note
+    except Exception:
+        pass
+    worst = max(p for p, _ in parts)
+    cls = "critical" if worst >= 90 else "warning" if worst >= 70 else "ok"
+    out(" · ".join(f"{p}%" for p, _ in parts), "\n".join(t for _, t in parts) + note, cls)
+
+CACHE.parent.mkdir(parents=True, exist_ok=True)
+with open(CACHE.with_suffix(".lock"), "w") as lock:
+    # Both bars fire at the same moment: the second one waits, then reads the fresh cache.
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        cache = json.loads(CACHE.read_text())
+    except Exception:
+        cache = {}
+    now = time.time()
+    data = cache.get("data")
+
+    if data and now - cache.get("fetched", 0) < CACHE_TTL:
+        render(data)
+    if now < cache.get("retry_after", 0):
+        wait = int((cache["retry_after"] - now) / 60) + 1
+        if data:
+            render(data, f"\n(limite de requêtes, nouvel essai dans {wait} min)")
+        out("…", f"Limite de requêtes, nouvel essai dans {wait} min", "off")
+
+    try:
+        oauth = json.loads((Path.home() / ".claude/.credentials.json").read_text())["claudeAiOauth"]
+    except Exception:
+        out("—", "Claude Code n'est pas connecté", "off")
+    if oauth.get("expiresAt", 0) / 1000 < now:
+        out("—", "Jeton expiré : lance Claude Code pour le renouveler", "off")
+
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
+        "Authorization": f"Bearer {oauth['accessToken']}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-version": "2023-06-01",
+        "Accept": "application/json",
+    })
+    try:
+        fresh = json.load(urllib.request.urlopen(req, timeout=10))
+        CACHE.write_text(json.dumps({"data": fresh, "fetched": now}))
+        render(fresh)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            try:
+                delay = max(int(e.headers.get("Retry-After", "")), 60)
+            except ValueError:
+                delay = BACKOFF
+            cache["retry_after"] = now + delay
+            CACHE.write_text(json.dumps(cache))
+        note = f"\n(erreur {e.code}, dernières valeurs connues)"
+    except Exception as e:
+        note = f"\n(erreur : {e}, dernières valeurs connues)"
+    if data:
+        render(data, note)
+    out("?", note.strip("\n()"), "off")

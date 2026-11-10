@@ -1,0 +1,11 @@
+#!/bin/bash
+# Bureaux attachés à leur écran : DP-1 = 1..5, DP-2 = 6..10.
+# Usage: hypr-ws N [move]   (N = 1..5, relatif à l'écran qui a le focus)
+n="$1"
+mon="$(hyprctl monitors -j | python3 -I -c 'import json,sys;print(next(m["name"] for m in json.load(sys.stdin) if m["focused"]))')"
+case "$mon" in DP-2) id=$((n + 5)) ;; *) id="$n" ;; esac
+if [ "$2" = move ]; then
+    hyprctl dispatch movetoworkspace "$id"
+else
+    hyprctl dispatch workspace "$id"
+fi

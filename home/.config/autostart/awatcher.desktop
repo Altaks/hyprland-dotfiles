@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Awatcher
+Comment=Temps d'écran (ActivityWatch)
+Exec=awatcher
+Icon=/usr/share/awatcher/icons/awatcher.png
+OnlyShowIn=GNOME;
+X-GNOME-Autostart-enabled=true

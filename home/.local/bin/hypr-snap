@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Snap a window into a zone of a workspace, like Windows/GNOME edge snapping.
+
+Used by the overview (Super+Tab) when a window is dropped on a workspace card,
+and by hypr-dragsnap (Super+drag to a screen edge):
+  hypr-snap <address> <workspace> <zone>
+zone = left | right | tl | tr | bl | br | max | move (just move, keep the layout).
+The window is made floating and fills the zone inside the usable area (monitor
+minus Waybar), with the same gaps as the tiling layout (as hypr-grid).
+Its size/state before the first snap is kept in $XDG_RUNTIME_DIR/hypr-snap.json
+so hypr-dragsnap can restore it when the window is dragged out of the zone.
+"""
+import json, os, subprocess, sys
+
+GAP_OUT, GAP_IN = 10, 10
+# (x, y, w, h) as fractions of the usable area
+ZONES = {
+    "left": (0, 0, .5, 1), "right": (.5, 0, .5, 1),
+    "tl": (0, 0, .5, .5), "tr": (.5, 0, .5, .5),
+    "bl": (0, .5, .5, .5), "br": (.5, .5, .5, .5),
+    "max": (0, 0, 1, 1),
+}
+STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "hypr-snap.json")
+
+def hyprctl(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True).stdout
+
+def dispatch(*cmds):
+    hyprctl("--batch", " ; ".join("dispatch " + c for c in cmds))
+
+def zone_rect(mon, zone):
+    """Global (x, y, w, h) of a zone on a monitor (hyprctl monitors -j entry)."""
+    left, top, right, bottom = mon["reserved"]
+    scale = mon["scale"]
+    area_x = mon["x"] + left + GAP_OUT
+    area_y = mon["y"] + top + GAP_OUT
+    area_w = mon["width"] / scale - left - right - 2 * GAP_OUT
+    area_h = mon["height"] / scale - top - bottom - 2 * GAP_OUT
+    fx, fy, fw, fh = ZONES[zone]
+    # Half the inner gap on each side that touches another zone
+    x = area_x + fx * area_w + (GAP_IN / 2 if fx else 0)
+    y = area_y + fy * area_h + (GAP_IN / 2 if fy else 0)
+    w = fw * area_w - (GAP_IN / 2 if fw < 1 else 0)
+    h = fh * area_h - (GAP_IN / 2 if fh < 1 else 0)
+    return round(x), round(y), round(w), round(h)
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+def save_state(state):
+    with open(STATE, "w") as f:
+        json.dump(state, f)
+
+def main(addr, ws_id, zone):
+    win = next((c for c in json.loads(hyprctl("-j", "clients")) if c["address"] == addr), None)
+    if not win:
+        sys.exit(1)
+
+    cmds = []
+    if win["workspace"]["id"] != ws_id:
+        cmds.append(f"movetoworkspacesilent {ws_id},address:{addr}")
+    if zone in ZONES:
+        ws = next((w for w in json.loads(hyprctl("-j", "workspaces")) if w["id"] == ws_id), None)
+        mon_name = ws["monitor"] if ws else win["monitor"]
+        mons = json.loads(hyprctl("-j", "monitors"))
+        mon = next((m for m in mons if m["name"] == mon_name or m["id"] == mon_name), mons[0])
+        x, y, w, h = zone_rect(mon, zone)
+        state = load_state()
+        if addr not in state:
+            state[addr] = {"floating": win["floating"], "size": win["size"]}
+        state[addr]["rect"] = [x, y, w, h]
+        save_state(state)
+        if not win["floating"]:
+            cmds.append(f"setfloating address:{addr}")
+        cmds.append(f"resizewindowpixel exact {w} {h},address:{addr}")
+        cmds.append(f"movewindowpixel exact {x} {y},address:{addr}")
+    if cmds:
+        dispatch(*cmds)
+
+if __name__ == "__main__":
+    main(sys.argv[1], int(sys.argv[2]), sys.argv[3])

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Claude Code tokens used and their API-price equivalent, for the plan's two windows.
+
+Reads the local transcripts (~/.claude/projects/**/*.jsonl, sub-agents included) and sums
+each API response once (deduplicated by message id). The windows match the plan usage shown
+by claude-usage-waybar: they start 5 h / 7 days before the resets_at it cached (fallback: the
+last 5 h / 7 days). The result is cached CACHE_TTL seconds in ~/.cache/claude-tokens.json.
+
+Prices: platform.claude.com/docs/en/about-claude/pricing (checked 2026-10-23), $ per MTok:
+(input, 5 min cache write, 1 h cache write, cache read, output). Fast mode doubles every rate,
+US-only inference (inference_geo "us") multiplies them by 1.1.
+"""
+import json, time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CACHE_TTL = 60
+HOME = Path.home()
+CACHE = HOME / ".cache/claude-tokens.json"
+
+PRICES = [  # longest prefix first
+    ("claude-fable-5-1", (10, 12.5, 20, 0.25, 50)),
+    ("claude-mythos-5-1", (10, 12.5, 20, 0.25, 50)),
+    ("claude-fable-5", (10, 12.5, 20, 1, 50)),
+    ("claude-mythos-5", (10, 12.5, 20, 1, 50)),
+    ("claude-opus-5-5", (4, 5, 8, 0.20, 20)),
+    ("claude-opus-5", (5, 6.25, 10, 0.50, 25)),
+    ("claude-opus-4-8", (5, 6.25, 10, 0.50, 25)),
+    ("claude-opus-4-7", (5, 6.25, 10, 0.50, 25)),
+    ("claude-opus-4-6", (5, 6.25, 10, 0.50, 25)),
+    ("claude-opus-4-5", (5, 6.25, 10, 0.50, 25)),
+    ("claude-opus-4", (15, 18.75, 30, 1.50, 75)),
+    ("claude-sonnet-5-5", (2, 2.5, 4, 0.10, 10)),
+    ("claude-sonnet-5", (2, 2.5, 4, 0.20, 10)),
+    ("claude-sonnet-4", (3, 3.75, 6, 0.30, 15)),
+    ("claude-haiku-5-5", (0.10, 0.125, 0.20, 0.01, 0.50)),
+    ("claude-haiku-4-5", (1, 1.25, 2, 0.10, 5)),
+    ("claude-3-5-haiku", (0.80, 1, 1.60, 0.08, 4)),
+]
+HAIKU_55_LONG = (0.50, 0.625, 1, 0.05, 2.50)  # prompts over 100k tokens
+
+
+def prices(model, prompt):
+    if model.startswith("claude-haiku-5-5") and prompt > 100_000:
+        return HAIKU_55_LONG
+    return next((p for k, p in PRICES if model.startswith(k)), None)
+
+
+def windows(now):
+    """(start of the 5 h window, start of the 7-day window), from the plan usage cache."""
+    starts = [now - timedelta(hours=5), now - timedelta(days=7)]
+    try:
+        data = json.loads((HOME / ".cache/claude-usage-waybar.json").read_text())["data"]
+        for i, (key, span) in enumerate((("five_hour", timedelta(hours=5)), ("seven_day", timedelta(days=7)))):
+            reset = datetime.fromisoformat(data[key]["resets_at"])
+            if reset > now:  # a stale reset is in the past: keep the rolling fallback
+                starts[i] = reset - span
+    except Exception:
+        pass
+    return starts
+
+
+def empty():
+    return {"tokens": 0, "input": 0, "cacheWrite": 0, "cacheRead": 0, "output": 0, "cost": 0.0, "unpriced": 0}
+
+
+def compute():
+    now = datetime.now(timezone.utc)
+    start5, start7 = windows(now)
+    oldest = min(start5, start7).timestamp()
+    out = {"session": empty(), "week": empty(), "models": {}}
+    seen = set()
+    for f in (HOME / ".claude/projects").rglob("*.jsonl"):
+        try:
+            if f.stat().st_mtime < oldest:
+                continue
+            lines = f.open(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with lines:
+            for line in lines:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                    m = o["message"]
+                    u = m["usage"]
+                    ts = datetime.fromisoformat(o["timestamp"].replace("Z", "+00:00"))
+                except (ValueError, KeyError, TypeError):
+                    continue
+                key = m.get("id") or o.get("requestId")
+                if ts < start7 and ts < start5 or not key or key in seen:
+                    continue
+                seen.add(key)
+                model = m.get("model") or ""
+                if model.startswith("<"):  # "<synthetic>" local messages, no API call
+                    continue
+                inp = u.get("input_tokens") or 0
+                read = u.get("cache_read_input_tokens") or 0
+                cc = u.get("cache_creation") or {}
+                w1h = cc.get("ephemeral_1h_input_tokens") or 0
+                w5m = cc.get("ephemeral_5m_input_tokens")
+                if w5m is None:
+                    w5m = (u.get("cache_creation_input_tokens") or 0) - w1h
+                outp = u.get("output_tokens") or 0
+                p = prices(model, inp + read + w5m + w1h)
+                cost = 0.0
+                if p:
+                    cost = (inp * p[0] + w5m * p[1] + w1h * p[2] + read * p[3] + outp * p[4]) / 1e6
+                    if u.get("speed") == "fast":
+                        cost *= 2
+                    if u.get("inference_geo") == "us":
+                        cost *= 1.1
+                for name, start in (("session", start5), ("week", start7)):
+                    if ts < start:
+                        continue
+                    w = out[name]
+                    w["input"] += inp
+                    w["cacheWrite"] += w5m + w1h
+                    w["cacheRead"] += read
+                    w["output"] += outp
+                    w["tokens"] += inp + w5m + w1h + read + outp
+                    w["cost"] += cost
+                    if not p:
+                        w["unpriced"] += 1
+                if ts >= start7:
+                    mm = out["models"].setdefault(model, {"tokens": 0, "cost": 0.0})
+                    mm["tokens"] += inp + w5m + w1h + read + outp
+                    mm["cost"] += cost
+    for w in (out["session"], out["week"]):
+        w["cost"] = round(w["cost"], 2)
+    for mm in out["models"].values():
+        mm["cost"] = round(mm["cost"], 2)
+    out["sessionStart"] = start5.isoformat()
+    out["weekStart"] = start7.isoformat()
+    return out
+
+
+try:
+    cache = json.loads(CACHE.read_text())
+    fresh = time.time() - cache.get("computed", 0) < CACHE_TTL
+except Exception:
+    cache, fresh = None, False
+if not fresh:
+    cache = compute()
+    cache["computed"] = time.time()
+    tmp = CACHE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache))
+    tmp.replace(CACHE)
+print(json.dumps(cache))

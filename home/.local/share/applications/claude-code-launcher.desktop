@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Code
+Comment=Ouvre un terminal avec Claude Code
+Exec=@HOME@/.local/bin/claude-term
+Icon=claude-code-launcher
+Terminal=false
+Categories=Development;
+StartupNotify=true

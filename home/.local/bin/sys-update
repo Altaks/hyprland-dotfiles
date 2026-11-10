@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Installe les mises à jour affichées dans l'onglet « Mises à jour » du tableau de bord.
+# Usage : sys-update [apt] [snap] [flatpak] [brew] [firmware] [zen]   (sans argument = tout)
+# Lancé dans un terminal par le tableau de bord ; demande le mot de passe sudo.
+set -u
+targets=("$@")
+[ ${#targets[@]} -eq 0 ] && targets=(apt snap flatpak brew firmware zen)
+has() { printf '%s\n' "${targets[@]}" | grep -qx "$1"; }
+step() { printf '\n\e[1;35m==> %s\e[0m\n' "$1"; }
+
+has apt      && { step "Ubuntu (apt)"; sudo apt update && sudo apt full-upgrade; }
+has snap     && { step "Snap"; sudo snap refresh; }
+has flatpak  && { step "Flatpak"; flatpak update -y; }
+has brew     && { step "Homebrew"; /home/linuxbrew/.linuxbrew/bin/brew upgrade; }
+has firmware && { step "Firmware"; fwupdmgr refresh --force >/dev/null 2>&1; fwupdmgr update; }
+has zen      && { step "Zen Browser"; ~/.local/bin/zen-update; }
+
+step "Actualisation du tableau de bord"
+~/.local/bin/updates-fetch --force >/dev/null
+[ -e /var/run/reboot-required ] && printf '\n\e[1;33m󰜉  Redémarrage nécessaire pour terminer certaines mises à jour.\e[0m\n'
+printf '\nTerminé. '
+read -rp "Entrée pour fermer…"

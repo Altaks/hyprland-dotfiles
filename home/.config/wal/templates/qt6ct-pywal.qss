@@ -1,0 +1,14 @@
+* {{ font-family: "CaskaydiaCove Nerd Font"; }}
+QWidget {{ background: {background}; color: {foreground}; }}
+QTabWidget::pane {{ border: 2px solid {color8}; border-radius: 12px; top: -1px; }}
+QTabBar::tab {{ background: transparent; color: {foreground}; padding: 8px 18px; margin: 4px 2px; border-radius: 10px; }}
+QTabBar::tab:selected {{ background: {color4}; color: {background}; font-weight: bold; }}
+QTabBar::tab:hover:!selected {{ background: {color0}; }}
+QPushButton, QToolButton {{ background: rgba({color8.rgb}, 0.22); border: 2px solid transparent; border-radius: 10px; padding: 2px 16px; margin: 3px 10px; min-height: 26px; }}
+QPushButton:hover, QToolButton:hover {{ border: 2px solid {color4}; }}
+QPushButton:pressed, QToolButton:pressed {{ background: {color4}; color: {background}; }}
+QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 5px; border: 2px solid {color8}; }}
+QCheckBox::indicator:checked {{ background: {color4}; border-color: {color4}; }}
+QScrollBar:vertical {{ background: transparent; width: 8px; }}
+QScrollBar::handle:vertical {{ background: {color8}; border-radius: 4px; min-height: 30px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
