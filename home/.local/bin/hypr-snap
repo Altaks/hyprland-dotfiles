@@ -71,7 +71,7 @@ def main(addr, ws_id, zone):
         x, y, w, h = zone_rect(mon, zone)
         state = load_state()
         if addr not in state:
-            state[addr] = {"floating": win["floating"], "size": win["size"]}
+            state[addr] = {"floating": win["floating"], "size": win["size"], "at": win["at"]}
         state[addr]["rect"] = [x, y, w, h]
         save_state(state)
         if not win["floating"]:

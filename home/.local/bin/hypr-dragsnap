@@ -16,9 +16,11 @@ from evdev import ecodes
 EDGE = 8          # px from a screen edge that triggers a zone
 CORNER = 0.2      # part of an edge (from each end) that means a corner
 POLL = 0.025      # s between cursor reads
+DOUBLE = 0.4      # s between two Super+clicks that make a double-click
 
 RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
 PIDFILE = os.path.join(RUN, "hypr-dragsnap.pid")
+LASTCLICK = os.path.join(RUN, "hypr-dragsnap.last")
 SOCK = os.path.join(RUN, "hypr", os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""), ".socket.sock")
 snap = importlib.machinery.SourceFileLoader(
     "hypr_snap", os.path.expanduser("~/.local/bin/hypr-snap")).load_module()
@@ -108,7 +110,50 @@ def restore(win, addr, info, cx):
     dispatch(f"resizewindowpixel exact {w} {h},address:{addr}",
              f"movewindowpixel exact {x} {win['at'][1]},address:{addr}")
 
+def double_click():
+    """Second Super+click on the same window within DOUBLE s: toggle maximised."""
+    now = time.monotonic()
+    addr = hypr_json("activewindow").get("address")
+    try:
+        with open(LASTCLICK) as f:
+            last = json.load(f)
+    except (OSError, ValueError):
+        last = {}
+    if addr and last.get("addr") == addr and now - last.get("t", 0) < DOUBLE:
+        os.remove(LASTCLICK)
+        toggle_max(addr)
+        return True
+    with open(LASTCLICK, "w") as f:
+        json.dump({"addr": addr, "t": now}, f)
+    return False
+
+def toggle_max(addr):
+    win = next((c for c in hypr_json("clients") if c["address"] == addr), None)
+    if not win:
+        return
+    if win.get("fullscreen"):
+        dispatch(f"fullscreenstate 0 -1,address:{addr}")
+        return
+    state = snap.load_state()
+    info = state.get(addr)
+    mon = next(m for m in hypr_json("monitors") if m["id"] == win["monitor"])
+    maxed = info and win["floating"] and [*win["at"], *win["size"]] == list(snap.zone_rect(mon, "max"))
+    if not maxed:
+        snap.main(addr, win["workspace"]["id"], "max")
+        return
+    del state[addr]
+    snap.save_state(state)
+    if not info["floating"]:
+        dispatch(f"settiled address:{addr}")
+        return
+    w, h = info["size"]
+    x, y = info.get("at") or (win["at"][0] + (win["size"][0] - w) // 2, win["at"][1] + (win["size"][1] - h) // 2)
+    dispatch(f"resizewindowpixel exact {w} {h},address:{addr}",
+             f"movewindowpixel exact {x} {y},address:{addr}")
+
 def main():
+    if double_click():
+        return
     if already_running():
         return
     with open(PIDFILE, "w") as f:
